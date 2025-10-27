@@ -144,11 +144,12 @@ class GameStateAdapter:
         
         score = self.points[player_team] - self.points[opponent_team]
         
-        # check if a team made the match
-        if self.points[player_team] > 0 and self.points[opponent_team] == 0:
-            score += 100
-        elif self.points[opponent_team] > 0 and self.points[player_team] == 0:
-            score -= 100
+        # check if a team made the match (only valid at terminal state)
+        if self.nr_tricks == 9:
+            if self.points[player_team] > 0 and self.points[opponent_team] == 0:
+                score += 100
+            elif self.points[opponent_team] > 0 and self.points[player_team] == 0:
+                score -= 100
             
         return score / 257.0
 
@@ -196,7 +197,7 @@ class MCTSAgent(Agent):
                 for _ in range(samples_per_trump):
                     hands = self._sample_hidden_state(obs_t)
                     state = GameStateAdapter(obs_t, hands)
-                    reward = self._rollout(state, self.config.rollout_depth, root_player=obs.player)
+                    reward = self._rollout(state, root_player=obs.player)
                     total += reward
                     count += 1
                 avg = total / max(1, count)
@@ -256,7 +257,8 @@ class MCTSAgent(Agent):
         """
         Runs the main MCTS algorithm for a given number of iterations or time budget.
         Uses a time budget if configured; otherwise uses a fixed iteration budget.
-        Reuses one determinized world for multiple rollouts to amortize dealing cost.
+        IMPORTANT: Perform one complete simulation per determinization (sampled world)
+        to correctly handle imperfect information.
         """
         import time
 
@@ -268,42 +270,40 @@ class MCTSAgent(Agent):
 
         iters = 0
         while True:
+            # Budget check
             if deadline is None:
                 if iters >= self.config.iterations:
                     break
             else:
                 if time.perf_counter() >= deadline:
                     break
-            iters += 1
 
-            # Sample one determinized world
+            # One determinization per full simulation
             hands = self._sample_hidden_state(obs)
 
-            # Run several rollouts on the same world
-            inner_rollouts = max(1, int(self.config.determinization_samples))
-            for _ in range(inner_rollouts):
-                if deadline is not None and time.perf_counter() >= deadline:
-                    break
+            # INIT STATE FOR THIS SIMULATION
+            state = GameStateAdapter(obs, hands)
+            node = root
 
-                state = GameStateAdapter(obs, hands)
-                node = root
+            # SELECTION
+            while not node.untried_actions and node.children:
+                node = self._select(node)
+                state.step(node.action)
 
-                # SELECTION
-                while not node.untried_actions and node.children:
-                    node = self._select(node)
-                    state.step(node.action)
+            # EXPANSION
+            if node.untried_actions:
+                action = int(self._rng.choice(node.untried_actions))
+                state.step(action)
+                node = self._expand(node, action, state)
 
-                # EXPANSION
-                if node.untried_actions:
-                    action = int(self._rng.choice(node.untried_actions))
-                    state.step(action)
-                    node = self._expand(node, action, state)
+            # SIMULATION (Rollout)
+            reward = self._rollout(state, root_player=obs.player)
 
-                # SIMULATION (Rollout)
-                reward = self._rollout(state, self.config.rollout_depth, root_player=obs.player)
+            # BACKPROPAGATION
+            self._backpropagate(node, reward, root_player=obs.player)
 
-                # BACKPROPAGATION
-                self._backpropagate(node, reward, root_player=obs.player)
+            # Count this completed simulation
+            iters += 1
 
         return root
 
@@ -319,7 +319,11 @@ class MCTSAgent(Agent):
             if child.visits == 0:
                 score = np.inf
             else:
-                exploit = child.value / child.visits
+                # child.value is stored from the child's player_to_move perspective
+                # Convert it to the current node player's team perspective for selection.
+                same_team = (child.player_to_move % 2) == (node.player_to_move % 2)
+                exploit_raw = child.value / child.visits
+                exploit = exploit_raw if same_team else -exploit_raw
                 explore = np.sqrt(np.log(max(1, node.visits)) / child.visits)
                 score = exploit + self.config.c_uct * explore
             if score > best_score:
@@ -338,25 +342,21 @@ class MCTSAgent(Agent):
         node.children[action] = new_node
         return new_node
 
-    def _rollout(self, state: GameStateAdapter, depth_limit: int, root_player: int) -> float:
+    def _rollout(self, state: GameStateAdapter, root_player: int) -> float:
         """
-        Simulates a game from the current state to a terminal state or depth limit.
+        Simulate to the end of the game and return the final normalized score
+        from the root player's team perspective.
         """
-        for _ in range(depth_limit):
-            if state.is_terminal():
-                break
-            
+        # Continue until terminal state (full game simulated)
+        while not state.is_terminal():
             hand = state.hands[state.player]
             valid_cards = self._rule.get_valid_cards(hand, state.current_trick, state.nr_cards_in_trick, state.trump)
             valid_indices = np.flatnonzero(valid_cards)
             if len(valid_indices) == 0:
-                # This can happen if the determinization is inconsistent with the game rules.
-                # In this case, we stop the rollout and return the current score.
+                # Determinization inconsistency: stop and evaluate current score
                 break
-            
             action = self._rng.choice(valid_indices)
             state.step(action)
-        # Score from the root player's team perspective
         return state.score(root_player)
 
     def _backpropagate(self, node: MCTSNode, reward: float, root_player: int):
@@ -367,7 +367,7 @@ class MCTSAgent(Agent):
             node.visits += 1
             # reward is from the root player's team perspective
             if (node.player_to_move % 2) != (root_player % 2):
-                node.value += (1.0 - reward)
+                node.value -= reward
             else:
                 node.value += reward
             node = node.parent
@@ -446,9 +446,9 @@ def main():
     logging.basicConfig(level=logging.WARNING)
 
     # setup the arena
-    arena = Arena(nr_games_to_play=10)
+    arena = Arena(nr_games_to_play=25)
     player = AgentRandomSchieber()
-    my_player = MCTSAgent(MCTSConfig(iterations=500, time_limit_ms=500, rollout_depth=10, determinization_samples=8))
+    my_player = MCTSAgent(MCTSConfig(iterations=500, time_limit_ms=250, determinization_samples=8))
 
     arena.set_players(my_player, player, my_player, player)
     print('Playing {} games'.format(arena.nr_games_to_play))
