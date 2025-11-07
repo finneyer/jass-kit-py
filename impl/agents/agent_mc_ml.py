@@ -17,6 +17,8 @@ from jass.arena.arena import Arena
 import logging
 
 import joblib
+from pathlib import Path
+import os
 
 
 @dataclass
@@ -159,12 +161,12 @@ class GameStateAdapter:
         return score / 257.0
 
 
-class MCTSAgent(Agent):
+class MCTSAgent_ML(Agent):
     """
     An agent that uses Monte Carlo Tree Search to decide its actions.
     """
 
-    def __init__(self, config: Optional[MCTSConfig] = None, model_path: str = "../models/svm_trump_model.pkl"):
+    def __init__(self, config: Optional[MCTSConfig] = None, model_path: str = None):
         """
         Initializes the MCTS agent.
         """
@@ -173,6 +175,10 @@ class MCTSAgent(Agent):
         self.config = config or MCTSConfig()
         self.rollout_policy = AgentRandomSchieber()
         self._rng = np.random.default_rng()
+
+        base_dir = Path(__file__).resolve().parent
+        if model_path is None:
+            model_path = base_dir / "../models/svm_trump_model.pkl"
         self.trump_model = joblib.load(model_path)
 
     def action_trump(self, obs: GameObservation) -> int:
@@ -446,7 +452,7 @@ def main():
     # setup the arena
     arena = Arena(nr_games_to_play=25)
     player = AgentRandomSchieber()
-    my_player = MCTSAgent(MCTSConfig(iterations=500, time_limit_ms=250, determinization_samples=8), "../models/svm_trump_model.pkl")
+    my_player = MCTSAgent_ML(MCTSConfig(iterations=500, time_limit_ms=250, determinization_samples=8), "../models/svm_trump_model.pkl")
     arena.set_players(my_player, player, my_player, player)
     print('Playing {} games'.format(arena.nr_games_to_play))
     arena.play_all_games()
