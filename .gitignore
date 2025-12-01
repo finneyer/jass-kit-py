@@ -136,3 +136,4 @@ dmypy.json
 !/requirements.txt
 
 *.csv
+!2018_10_18_trump.csv
