@@ -1,0 +1,460 @@
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Optional, Dict, List, Any, Tuple
+import time
+
+import numpy as np
+import torch
+
+from jass.agents.agent import Agent
+from jass.game.const import PUSH, next_player, partner_player, card_values
+from jass.game.game_observation import GameObservation
+from jass.game.game_rule import GameRule
+from jass.game.game_util import convert_one_hot_encoded_cards_to_int_encoded_list, \
+    convert_int_encoded_cards_to_str_encoded
+from jass.game.rule_schieber import RuleSchieber
+from jass.agents.agent_random_schieber import AgentRandomSchieber
+from jass.arena.arena import Arena
+from impl.models.alpha_zero_model import JassNet
+from impl.service.alpha_zero_utils import convert_obs_to_tensor
+import logging
+
+
+class NeuralNetwork:
+    """
+    Abstract interface for the AlphaZero neural network.
+    """
+    def predict(self, obs: GameObservation) -> Tuple[np.ndarray, float]:
+        """
+        Predicts the policy and value for a given observation.
+        
+        Args:
+            obs: The game observation from the perspective of the current player.
+            
+        Returns:
+            policy: A numpy array of size 36 (one for each card) representing action probabilities.
+            value: A float in [-1, 1] representing the expected score/win probability.
+        """
+        raise NotImplementedError
+
+
+class DummyNetwork(NeuralNetwork):
+    """
+    A dummy network that returns uniform probabilities and random values.
+    Used when no trained model is available.
+    """
+    def predict(self, obs: GameObservation) -> Tuple[np.ndarray, float]:
+        # Uniform policy over all 36 cards (validity will be masked by the search)
+        policy = np.ones(36, dtype=np.float32) / 36.0
+        # Random value
+        value = np.random.uniform(-0.1, 0.1)
+        return policy, value
+
+
+@dataclass
+class AlphaZeroConfig:
+    """Configuration for the AlphaZero agent."""
+    iterations: int = 200
+    time_limit_ms: Optional[int] = 150
+    c_puct: float = 1.0
+    dirichlet_alpha: float = 0.3
+    dirichlet_epsilon: float = 0.25
+    determinization_samples: int = 8
+
+
+@dataclass
+class AlphaZeroNode:
+    """A node in the AlphaZero search tree."""
+    parent: Optional[AlphaZeroNode] = None
+    children: Dict[int, AlphaZeroNode] = field(default_factory=dict)
+    visits: int = 0
+    value_sum: float = 0.0
+    prior: float = 0.0
+    player_to_move: int = -1
+    is_expanded: bool = False
+    # Cached policy from the network, used to instantiate children lazily
+    policy_probs: Optional[np.ndarray] = None
+
+    @property
+    def value(self) -> float:
+        return self.value_sum / self.visits if self.visits > 0 else 0.0
+
+
+class GameStateAdapter:
+    """
+    A lightweight adapter for the Jass game state to be used in MCTS.
+    It must be cloneable and provide methods to step through the game.
+    Crucially, it must enforce that only information available to the current
+    player is used.
+    """
+    def __init__(self, obs: GameObservation, determinized_hands: np.ndarray):
+        """
+        Initializes the state from a player's observation and a specific
+        determinization of hidden cards.
+        """
+        self._rule = RuleSchieber()
+        self.player = obs.player
+        self.trump = obs.trump
+        self.hands = determinized_hands
+        self.tricks = np.copy(obs.tricks)
+        self.nr_tricks = obs.nr_tricks
+        self.nr_cards_in_trick = obs.nr_cards_in_trick
+        self.trick_first_player = np.copy(obs.trick_first_player)
+        self.trick_winner = np.copy(obs.trick_winner)
+        self.trick_points = np.copy(obs.trick_points)
+        self.points = np.copy(obs.points)
+
+        if self.nr_cards_in_trick > 0:
+            self.current_trick = self.tricks[self.nr_tricks]
+        else:
+            self.current_trick = np.full(4, -1, dtype=np.int32)
+
+
+    def clone(self) -> GameStateAdapter:
+        """Return a deep copy of the current game state."""
+        # create a new, empty object and copy over the state
+        new_state = GameStateAdapter.__new__(GameStateAdapter)
+        new_state._rule = self._rule
+        new_state.player = self.player
+        new_state.trump = self.trump
+        new_state.hands = np.copy(self.hands)
+        new_state.tricks = np.copy(self.tricks)
+        new_state.nr_tricks = self.nr_tricks
+        new_state.nr_cards_in_trick = self.nr_cards_in_trick
+        new_state.trick_first_player = np.copy(self.trick_first_player)
+        new_state.trick_winner = np.copy(self.trick_winner)
+        new_state.trick_points = np.copy(self.trick_points)
+        new_state.points = np.copy(self.points)
+        new_state.current_trick = np.copy(self.current_trick)
+        return new_state
+
+    def valid_actions(self) -> List[int]:
+        """Return a list of valid actions for the current player."""
+        hand = self.hands[self.player]
+        valid_cards_mask = self._rule.get_valid_cards(hand, self.current_trick, self.nr_cards_in_trick, self.trump)
+        return np.flatnonzero(valid_cards_mask).tolist()
+
+    def step(self, action: int) -> None:
+        """
+        Apply an action and update the game state.
+        """
+        # card is played
+        self.hands[self.player, action] = 0
+        self.current_trick[self.nr_cards_in_trick] = action
+        self.nr_cards_in_trick += 1
+
+        if self.nr_cards_in_trick == 4:
+            # trick is complete
+            self.tricks[self.nr_tricks] = self.current_trick
+            self.trick_winner[self.nr_tricks] = self._rule.calc_winner(self.current_trick, self.trick_first_player[self.nr_tricks], self.trump)
+            self.trick_points[self.nr_tricks] = self._rule.calc_points(self.current_trick, self.nr_tricks == 8, self.trump)
+
+            winner = self.trick_winner[self.nr_tricks]
+            if winner == 0 or winner == 2:
+                self.points[0] += self.trick_points[self.nr_tricks]
+            else:
+                self.points[1] += self.trick_points[self.nr_tricks]
+
+            self.nr_tricks += 1
+            self.nr_cards_in_trick = 0
+            self.player = winner
+            if self.nr_tricks < 9:
+                self.trick_first_player[self.nr_tricks] = self.player
+                # rebind to the next trick row and clear
+                self.current_trick = self.tricks[self.nr_tricks]
+                self.current_trick.fill(-1)
+        else:
+            self.player = next_player[self.player]
+
+
+    def is_terminal(self) -> bool:
+        """Check if the game has ended."""
+        return self.nr_tricks == 9
+
+    def score(self, player: int) -> float:
+        """
+        Return the final score for the given player's team, normalized to [-1, 1].
+        Max possible score is 157 + 100 for match.
+        """
+        player_team = 0 if player == 0 or player == 2 else 1
+        opponent_team = 1 - player_team
+        
+        score = self.points[player_team] - self.points[opponent_team]
+        
+        # check if a team made the match (only valid at terminal state)
+        if self.nr_tricks == 9:
+            if self.points[player_team] > 0 and self.points[opponent_team] == 0:
+                score += 100
+            elif self.points[opponent_team] > 0 and self.points[player_team] == 0:
+                score -= 100
+            
+        return score / 257.0
+
+    def to_observation(self) -> GameObservation:
+        """
+        Constructs a GameObservation from the current state.
+        """
+        obs = GameObservation()
+        obs.dealer = -1 
+        obs.player = self.player
+        obs.player_view = self.player
+        obs.trump = self.trump
+        obs.forehand = -1
+        obs.declared_trump = self.trump
+        obs.hand = self.hands[self.player]
+        obs.tricks = self.tricks
+        obs.trick_winner = self.trick_winner
+        obs.trick_points = self.trick_points
+        obs.trick_first_player = self.trick_first_player
+        obs.current_trick = self.current_trick
+        obs.nr_tricks = self.nr_tricks
+        obs.nr_cards_in_trick = self.nr_cards_in_trick
+        obs.nr_played_cards = self.nr_tricks * 4 + self.nr_cards_in_trick
+        obs.points = self.points
+        return obs
+
+
+class AlphaZeroAgent(Agent):
+    """
+    An agent that uses AlphaZero-style MCTS (PUCT + Neural Network) to decide its actions.
+    """
+
+    def __init__(self, config: Optional[AlphaZeroConfig] = None, network: Optional[NeuralNetwork] = None):
+        super().__init__()
+        self._rule = RuleSchieber()
+        self.config = config or AlphaZeroConfig()
+        self.network = network or DummyNetwork()
+        self._rng = np.random.default_rng()
+
+    def action_trump(self, obs: GameObservation) -> int:
+        # For simplicity, use a basic heuristic or random for trump selection
+        # as AlphaZero is typically applied to the play phase here.
+        return AgentRandomSchieber().action_trump(obs)
+
+    def action_play_card(self, obs: GameObservation) -> int:
+        valid_cards = self._rule.get_valid_cards_from_obs(obs)
+        action_space = np.flatnonzero(valid_cards).tolist()
+
+        if not action_space:
+            raise ValueError("No valid cards to play.")
+        if len(action_space) == 1:
+            return action_space[0]
+
+        root = self._search(obs)
+
+        # Select best action based on visit counts
+        best_action = -1
+        max_visits = -1
+        for action, child in root.children.items():
+            if child.visits > max_visits:
+                max_visits = child.visits
+                best_action = action
+        
+        return best_action
+
+    def _search(self, obs: GameObservation) -> AlphaZeroNode:
+        root = AlphaZeroNode(parent=None, prior=0.0, player_to_move=obs.player)
+        
+        # Initial expansion of root
+        policy, _ = self.network.predict(obs)
+        root.policy_probs = policy
+        root.is_expanded = True
+
+        deadline = None
+        if self.config.time_limit_ms is not None:
+            deadline = time.perf_counter() + (self.config.time_limit_ms / 1000.0)
+
+        iters = 0
+        while True:
+            if deadline is None:
+                if iters >= self.config.iterations:
+                    break
+            else:
+                if time.perf_counter() >= deadline:
+                    break
+
+            # Determinize
+            hands = self._sample_hidden_state(obs)
+            state = GameStateAdapter(obs, hands)
+            node = root
+
+            # Selection
+            while node.is_expanded:
+                valid_actions = state.valid_actions()
+                
+                if not valid_actions:
+                    break
+                
+                self._ensure_children(node, valid_actions)
+                
+                action, node = self._select(node, valid_actions, state.player)
+                state.step(action)
+
+            # Expansion and Evaluation
+            if not state.is_terminal():
+                leaf_obs = state.to_observation()
+                policy, value = self.network.predict(leaf_obs)
+                
+                node.policy_probs = policy
+                node.is_expanded = True
+            else:
+                value = state.score(state.player)
+
+            # Backpropagation
+            self._backpropagate(node, value, state.player)
+
+            iters += 1
+
+        return root
+
+    def _ensure_children(self, node: AlphaZeroNode, valid_actions: List[int]):
+        """Ensures that child nodes exist for all valid actions."""
+        for action in valid_actions:
+            if action not in node.children:
+                prior = node.policy_probs[action] if node.policy_probs is not None else 0.0
+                node.children[action] = AlphaZeroNode(parent=node, prior=prior, player_to_move=-1)
+
+    def _select(self, node: AlphaZeroNode, valid_actions: List[int], player_to_move: int) -> Tuple[int, AlphaZeroNode]:
+        """Selects the best child according to PUCT."""
+        best_score = -np.inf
+        best_action = -1
+        best_child = None
+        
+        is_team_0 = (player_to_move % 2 == 0)
+
+        for action in valid_actions:
+            child = node.children[action]
+            
+            if child.visits > 0:
+                q_val_team_0 = child.value_sum / child.visits
+            else:
+                q_val_team_0 = 0.0
+
+            q_value = q_val_team_0 if is_team_0 else -q_val_team_0
+
+            u_value = self.config.c_puct * child.prior * np.sqrt(node.visits) / (1 + child.visits)
+            
+            score = q_value + u_value
+            
+            if score > best_score:
+                best_score = score
+                best_action = action
+                best_child = child
+        
+        return best_action, best_child
+
+    def _backpropagate(self, node: AlphaZeroNode, value: float, value_perspective_player: int):
+        """
+        Backpropagates the value up the tree.
+        """
+        team_0_value = value if (value_perspective_player % 2 == 0) else -value
+        current = node
+        while current is not None:
+            current.visits += 1
+            current.value_sum += team_0_value
+            current = current.parent
+
+    def _sample_hidden_state(self, obs: GameObservation) -> np.ndarray:
+        """
+        Generates a random, consistent assignment of cards for hidden hands.
+        """
+        # Known cards: our hand and all played cards
+        known = np.zeros(36, dtype=np.int32)
+        known[convert_one_hot_encoded_cards_to_int_encoded_list(obs.hand)] = 1
+
+        for t in range(obs.nr_tricks):
+            for card in obs.tricks[t]:
+                if card != -1:
+                    known[card] = 1
+        # include current trick cards
+        if obs.nr_tricks < 9 and obs.current_trick is not None:
+            for k in range(obs.nr_cards_in_trick):
+                card = obs.current_trick[k]
+                if card != -1:
+                    known[card] = 1
+
+        unknown_cards = np.flatnonzero(1 - known).tolist()
+        self._rng.shuffle(unknown_cards)
+
+        hands = np.zeros((4, 36), dtype=np.int32)
+        hands[obs.player] = obs.hand
+
+        # Determine how many cards each opponent should have left
+        # Each player starts with 9 cards. Each completed trick consumes 1 card per player.
+        # In the current trick, some players may already have played.
+        counts_needed = [0, 0, 0, 0]
+        first = int(obs.trick_first_player[obs.nr_tricks]) if obs.nr_tricks < 9 else 0
+        played_this_trick_players = set()
+        for i in range(obs.nr_cards_in_trick):
+            played_this_trick_players.add(int((first + i) % 4))
+
+        for p in range(4):
+            have = int(np.sum(hands[p]))
+            # expected remaining cards
+            expected = 9 - obs.nr_tricks - (1 if p in played_this_trick_players else 0)
+            if p == obs.player:
+                # sanity: our observed hand size should equal expected
+                # if mismatch due to data, clamp to observed
+                expected = have
+            need = max(0, expected - have)
+            counts_needed[p] = need
+
+        # Assign unknown cards to other players according to required counts
+        pos = 0
+        for p in range(4):
+            if p == obs.player:
+                continue
+            need = counts_needed[p]
+            if need > 0:
+                take = unknown_cards[pos:pos + need]
+                pos += need
+                if take:
+                    hands[p, take] = 1
+
+        # Any remaining unknown cards (due to mismatches) are distributed round-robin
+        while pos < len(unknown_cards):
+            for p in range(4):
+                if p == obs.player:
+                    continue
+                if pos >= len(unknown_cards):
+                    break
+                if np.sum(hands[p]) < 9 - obs.nr_tricks - (1 if p in played_this_trick_players else 0):
+                    hands[p, unknown_cards[pos]] = 1
+                    pos += 1
+
+        return hands
+
+class PytorchNetwork(NeuralNetwork):
+    def __init__(self, model_path: str):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = JassNet() # Initialize architecture
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.model.to(self.device)
+        self.model.eval()
+
+    def predict(self, obs: GameObservation) -> Tuple[np.ndarray, float]:
+        tensor_in = convert_obs_to_tensor(obs).to(self.device)
+        
+        with torch.no_grad():
+            policy, value = self.model(tensor_in)
+            
+        return policy.cpu().numpy()[0], value.item()
+
+def main():
+    logging.basicConfig(level=logging.WARNING)
+
+    # setup the arena
+    arena = Arena(nr_games_to_play=5)
+    player = AgentRandomSchieber()
+    # Use the dummy network for demonstration
+    my_player = AlphaZeroAgent(AlphaZeroConfig(iterations=100, time_limit_ms=100))
+
+    arena.set_players(my_player, player, my_player, player)
+    print('Playing {} games'.format(arena.nr_games_to_play))
+    arena.play_all_games()
+    print('Average Points Team 0: {:.2f}'.format(arena.points_team_0.mean()))
+    print('Average Points Team 1: {:.2f}'.format(arena.points_team_1.mean()))
+
+
+if __name__ == '__main__':
+    main()
