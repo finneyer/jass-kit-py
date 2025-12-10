@@ -2,6 +2,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any, Tuple
 import time
+import os
+import sys
+
+# Add project root to python path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 import numpy as np
 import torch
@@ -15,9 +20,10 @@ from jass.game.game_util import convert_one_hot_encoded_cards_to_int_encoded_lis
 from jass.game.rule_schieber import RuleSchieber
 from jass.agents.agent_random_schieber import AgentRandomSchieber
 from jass.arena.arena import Arena
-from impl.models.alpha_zero_model import JassNet
+from impl.service.alpha_zero_model_cnn import JassNet
 from impl.service.alpha_zero_utils import convert_obs_to_tensor
 import logging
+from impl.agents.agent_monte_carlo import MCTSAgent, MCTSConfig
 
 
 class NeuralNetwork:
@@ -60,6 +66,9 @@ class AlphaZeroConfig:
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
     determinization_samples: int = 8
+    use_rollouts: bool = False
+    rollout_count: int = 10
+    rollout_mixing: float = 0.9
 
 
 @dataclass
@@ -257,7 +266,23 @@ class AlphaZeroAgent(Agent):
         
         # Initial expansion of root
         policy, _ = self.network.predict(obs)
-        root.policy_probs = policy
+        
+        # Mask invalid actions
+        valid_actions = self._rule.get_valid_cards_from_obs(obs)
+        valid_mask = np.flatnonzero(valid_actions)
+        masked_policy = np.zeros_like(policy)
+
+        # Copy probabilities only for valid moves
+        masked_policy[valid_mask] = policy[valid_mask]
+
+        # Re-normalize to sum to 1
+        if masked_policy.sum() > 0:
+            masked_policy /= masked_policy.sum()
+        else:
+            # Fallback if network predicts 0 for all valid moves
+            masked_policy[valid_mask] = 1.0 / len(valid_mask)
+            
+        root.policy_probs = masked_policy
         root.is_expanded = True
 
         deadline = None
@@ -295,7 +320,33 @@ class AlphaZeroAgent(Agent):
                 leaf_obs = state.to_observation()
                 policy, value = self.network.predict(leaf_obs)
                 
-                node.policy_probs = policy
+                # Mask and renormalize policy for valid actions
+                # Use state.valid_actions() which is already computed correctly
+                valid_actions_list = state.valid_actions()
+                masked_policy_leaf = np.zeros_like(policy)
+                
+                if valid_actions_list:
+                    masked_policy_leaf[valid_actions_list] = policy[valid_actions_list]
+                    if masked_policy_leaf.sum() > 0:
+                        masked_policy_leaf /= masked_policy_leaf.sum()
+                    else:
+                        # Network predicted 0 for all valid moves, use uniform
+                        masked_policy_leaf[valid_actions_list] = 1.0 / len(valid_actions_list)
+                else:
+                    # No valid actions but not terminal - shouldn't happen, but handle gracefully
+                    # Just use uniform over all actions as fallback
+                    masked_policy_leaf = np.ones_like(policy) / len(policy)
+                
+                if self.config.use_rollouts:
+                    rollout_value_sum = 0.0
+                    for _ in range(self.config.rollout_count):
+                        rollout_value_sum += self._rollout(state)
+                    rollout_value = rollout_value_sum / self.config.rollout_count
+                    
+                    # Mix network value and rollout value
+                    value = (1 - self.config.rollout_mixing) * value + self.config.rollout_mixing * rollout_value
+                
+                node.policy_probs = masked_policy_leaf
                 node.is_expanded = True
             else:
                 value = state.score(state.player)
@@ -424,10 +475,25 @@ class AlphaZeroAgent(Agent):
 
         return hands
 
+    def _rollout(self, state: GameStateAdapter) -> float:
+        """
+        Performs a random rollout from the given state and returns the score.
+        """
+        rollout_state = state.clone()
+        while not rollout_state.is_terminal():
+            actions = rollout_state.valid_actions()
+            if not actions:
+                break
+            action = self._rng.choice(actions)
+            rollout_state.step(action)
+            
+        return rollout_state.score(state.player)
+
 class PytorchNetwork(NeuralNetwork):
     def __init__(self, model_path: str):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = JassNet() # Initialize architecture
+        # Match the architecture used in training: hidden_dim=256, num_res_blocks=3
+        self.model = JassNet(hidden_dim=256, num_res_blocks=3) 
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.to(self.device)
         self.model.eval()
@@ -441,19 +507,44 @@ class PytorchNetwork(NeuralNetwork):
         return policy.cpu().numpy()[0], value.item()
 
 def main():
-    logging.basicConfig(level=logging.WARNING)
+    logging.basicConfig(level=logging.INFO)
 
-    # setup the arena
-    arena = Arena(nr_games_to_play=5)
-    player = AgentRandomSchieber()
-    # Use the dummy network for demonstration
-    my_player = AlphaZeroAgent(AlphaZeroConfig(iterations=100, time_limit_ms=100))
+    model_path = "impl/models/alpha_zero_model_cnn.pth"
+    if not os.path.exists(model_path):
+        print(f"Model not found at {model_path}. Please train the model first.")
+        return
 
-    arena.set_players(my_player, player, my_player, player)
-    print('Playing {} games'.format(arena.nr_games_to_play))
+    print(f"Loading AlphaZero model from {model_path}...")
+    
+    # Initialize AlphaZero Agent
+    az_config = AlphaZeroConfig(iterations=400, time_limit_ms=500) 
+    az_network = PytorchNetwork(model_path)
+    az_agent = AlphaZeroAgent(config=az_config, network=az_network)
+    
+    # Initialize MCTS Agent (Baseline)
+    mcts_config = MCTSConfig(iterations=400, time_limit_ms=500)
+    mcts_agent = MCTSAgent(config=mcts_config)
+    random_player = AgentRandomSchieber()
+    
+    
+    # Setup Arena
+    arena = Arena(nr_games_to_play=10)
+    arena.set_players(az_agent, mcts_agent, az_agent, mcts_agent)
+    
+    print(f"Starting match: AlphaZero (Team 0) vs MCTS (Team 1)")
+    print(f"Playing {arena.nr_games_to_play} games...")
+    
     arena.play_all_games()
-    print('Average Points Team 0: {:.2f}'.format(arena.points_team_0.mean()))
-    print('Average Points Team 1: {:.2f}'.format(arena.points_team_1.mean()))
+    
+    print("\nResults:")
+    print(f"AlphaZero (Team 0) Average Points: {arena.points_team_0.mean():.2f}")
+    print(f"MCTS (Team 1) Average Points:      {arena.points_team_1.mean():.2f}")
+    
+    diff = arena.points_team_0.mean() - arena.points_team_1.mean()
+    if diff > 0:
+        print(f"AlphaZero won by {diff:.2f} points on average!")
+    else:
+        print(f"MCTS won by {-diff:.2f} points on average.")
 
 
 if __name__ == '__main__':
