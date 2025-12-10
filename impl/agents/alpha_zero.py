@@ -21,9 +21,16 @@ from jass.game.rule_schieber import RuleSchieber
 from jass.agents.agent_random_schieber import AgentRandomSchieber
 from jass.arena.arena import Arena
 from impl.service.alpha_zero_model_cnn import JassNet
+from impl.service.alpha_zero_model_transformer import JassTransformer, JassTransformerSequence
 from impl.service.alpha_zero_utils import convert_obs_to_tensor
 import logging
 from impl.agents.agent_monte_carlo import MCTSAgent, MCTSConfig
+
+# Import TrainConfig to allow unpickling of saved checkpoints
+try:
+    from impl.service.alpha_zero_train_transformer import TrainConfig as TransformerTrainConfig
+except ImportError:
+    TransformerTrainConfig = None
 
 
 class NeuralNetwork:
@@ -506,45 +513,141 @@ class PytorchNetwork(NeuralNetwork):
             
         return policy.cpu().numpy()[0], value.item()
 
+class PytorchTransformerNetwork(NeuralNetwork):
+    def __init__(self, model_path: str, use_sequence_model: bool = False,
+                 embed_dim: int = 128, num_heads: int = 4, ff_dim: int = 512,
+                 num_layers: int = 3, dropout: float = 0.1):
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+        
+        # Load state dict (weights only, no checkpoints)
+        state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
+        
+        # Create model with matching architecture
+        if use_sequence_model:
+            self.model = JassTransformerSequence(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                ff_dim=ff_dim,
+                num_layers=num_layers,
+                dropout=dropout
+            )
+        else:
+            self.model = JassTransformer(
+                input_dim=332,
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                ff_dim=ff_dim,
+                num_layers=num_layers,
+                dropout=dropout
+            )
+        
+        self.model.load_state_dict(state_dict)
+        self.model.to(self.device)
+        self.model.eval()
+
+    def predict(self, obs: GameObservation) -> Tuple[np.ndarray, float]:
+        tensor_in = convert_obs_to_tensor(obs).to(self.device)
+        
+        with torch.no_grad():
+            policy, value = self.model(tensor_in)
+            
+        return policy.cpu().numpy()[0], value.item()
+
 def main():
     logging.basicConfig(level=logging.INFO)
 
-    model_path = "impl/models/alpha_zero_model_cnn.pth"
-    if not os.path.exists(model_path):
-        print(f"Model not found at {model_path}. Please train the model first.")
+    # Load both models
+    transformer_model_path = "impl/models/alpha_zero_transformer_model.pth"
+    cnn_model_path = "impl/models/alpha_zero_model_cnn.pth"
+    
+    # Check which models are available
+    has_transformer = os.path.exists(transformer_model_path)
+    has_cnn = os.path.exists(cnn_model_path)
+    
+    if not has_transformer and not has_cnn:
+        print(f"No trained models found. Please train at least one model first.")
+        print(f"  Transformer: {transformer_model_path}")
+        print(f"  CNN: {cnn_model_path}")
         return
-
-    print(f"Loading AlphaZero model from {model_path}...")
     
-    # Initialize AlphaZero Agent
-    az_config = AlphaZeroConfig(iterations=400, time_limit_ms=500) 
-    az_network = PytorchNetwork(model_path)
-    az_agent = AlphaZeroAgent(config=az_config, network=az_network)
+    # Initialize AlphaZero config
+    az_config = AlphaZeroConfig(iterations=400, time_limit_ms=500)
     
-    # Initialize MCTS Agent (Baseline)
-    mcts_config = MCTSConfig(iterations=400, time_limit_ms=500)
-    mcts_agent = MCTSAgent(config=mcts_config)
-    random_player = AgentRandomSchieber()
-    
-    
-    # Setup Arena
-    arena = Arena(nr_games_to_play=10)
-    arena.set_players(az_agent, mcts_agent, az_agent, mcts_agent)
-    
-    print(f"Starting match: AlphaZero (Team 0) vs MCTS (Team 1)")
-    print(f"Playing {arena.nr_games_to_play} games...")
+    # Create agents based on available models
+    if has_transformer and has_cnn:
+        # Both models available - CNN vs Transformer
+        print(f"Loading Transformer model from {transformer_model_path}...")
+        transformer_network = PytorchTransformerNetwork(transformer_model_path)
+        transformer_agent = AlphaZeroAgent(config=az_config, network=transformer_network)
+        
+        print(f"Loading CNN model from {cnn_model_path}...")
+        cnn_network = PytorchNetwork(cnn_model_path)
+        cnn_agent = AlphaZeroAgent(config=az_config, network=cnn_network)
+        
+        # Setup Arena: Transformer (Team 0) vs CNN (Team 1)
+        arena = Arena(nr_games_to_play=20)
+        arena.set_players(transformer_agent, cnn_agent, transformer_agent, cnn_agent)
+        
+        print(f"\n{'='*60}")
+        print(f"Starting match: Transformer (Team 0) vs CNN (Team 1)")
+        print(f"Playing {arena.nr_games_to_play} games...")
+        print(f"{'='*60}\n")
+        
+    elif has_transformer:
+        # Only transformer available - play against MCTS
+        print(f"Loading Transformer model from {transformer_model_path}...")
+        transformer_network = PytorchTransformerNetwork(transformer_model_path)
+        transformer_agent = AlphaZeroAgent(config=az_config, network=transformer_network)
+        
+        mcts_config = MCTSConfig(iterations=400, time_limit_ms=500)
+        mcts_agent = MCTSAgent(config=mcts_config)
+        
+        arena = Arena(nr_games_to_play=20)
+        arena.set_players(transformer_agent, mcts_agent, transformer_agent, mcts_agent)
+        
+        print(f"\n{'='*60}")
+        print(f"Starting match: Transformer (Team 0) vs MCTS (Team 1)")
+        print(f"Playing {arena.nr_games_to_play} games...")
+        print(f"{'='*60}\n")
+        
+    else:
+        # Only CNN available - play against MCTS
+        print(f"Loading CNN model from {cnn_model_path}...")
+        cnn_network = PytorchNetwork(cnn_model_path)
+        cnn_agent = AlphaZeroAgent(config=az_config, network=cnn_network)
+        
+        mcts_config = MCTSConfig(iterations=400, time_limit_ms=500)
+        mcts_agent = MCTSAgent(config=mcts_config)
+        
+        arena = Arena(nr_games_to_play=20)
+        arena.set_players(cnn_agent, mcts_agent, cnn_agent, mcts_agent)
+        
+        print(f"\n{'='*60}")
+        print(f"Starting match: CNN (Team 0) vs MCTS (Team 1)")
+        print(f"Playing {arena.nr_games_to_play} games...")
+        print(f"{'='*60}\n")
     
     arena.play_all_games()
     
-    print("\nResults:")
-    print(f"AlphaZero (Team 0) Average Points: {arena.points_team_0.mean():.2f}")
-    print(f"MCTS (Team 1) Average Points:      {arena.points_team_1.mean():.2f}")
+    print("\n" + "="*60)
+    print("RESULTS")
+    print("="*60)
+    print(f"Team 0 Average Points: {arena.points_team_0.mean():.2f}")
+    print(f"Team 1 Average Points: {arena.points_team_1.mean():.2f}")
     
     diff = arena.points_team_0.mean() - arena.points_team_1.mean()
     if diff > 0:
-        print(f"AlphaZero won by {diff:.2f} points on average!")
+        print(f"\n🏆 Team 0 won by {diff:.2f} points on average!")
+    elif diff < 0:
+        print(f"\n🏆 Team 1 won by {-diff:.2f} points on average!")
     else:
-        print(f"MCTS won by {-diff:.2f} points on average.")
+        print(f"\n🤝 It's a tie!")
+    print("="*60)
 
 
 if __name__ == '__main__':
