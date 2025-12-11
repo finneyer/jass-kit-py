@@ -24,17 +24,24 @@ from jass.game.game_util import deal_random_hand
 
 @dataclass
 class TrainConfig:
-    iterations: int = 100  # Increased from 30
+    # Training parameters
+    iterations: int = 100
     games_per_iteration: int = 50
-    mcts_simulations: int = 300  # Reduced for faster generation, network will improve over time
-    batch_size: int = 64  # Increased for more stable gradients
-    learning_rate: float = 0.002  # Slightly higher initial LR
+    mcts_simulations: int = 400
+    batch_size: int = 128
+    learning_rate: float = 0.002
+    train_steps: int = 100
+    
+    # Model architecture
+    hidden_dim: int = 256
+    num_res_blocks: int = 3
+    
+    # System
     checkpoint_dir: str = "impl/models"
     model_name: str = "alpha_zero_model_cnn.pth"
     replay_buffer_size: int = 50000
-    min_buffer_size: int = 2000  # Require more data before training
-    train_steps: int = 100
-    num_workers: int = max(1, cpu_count() - 1)  # Leave 1 core free
+    min_buffer_size: int = 2000
+    num_workers: int = max(1, cpu_count() - 1)
 
 class TrainWrapper(NeuralNetwork):
     def __init__(self, model: JassNet, device):
@@ -131,13 +138,13 @@ def self_play(agent: AlphaZeroAgent, num_games: int) -> List[Tuple[GameObservati
 def self_play_single_game(args) -> List[Tuple[GameObservation, np.ndarray, float]]:
     """
     Play a single game. This function is designed to be called in parallel.
-    Args: (model_state_dict, mcts_simulations, game_idx)
+    Args: (model_state_dict, hidden_dim, num_res_blocks, mcts_simulations, game_idx)
     """
-    model_state_dict, mcts_simulations, game_idx = args
+    model_state_dict, hidden_dim, num_res_blocks, mcts_simulations, game_idx = args
     
     # Create model for this worker (CPU to avoid GPU contention)
     device = torch.device("cpu")
-    model = JassNet(hidden_dim=256, num_res_blocks=3).to(device)
+    model = JassNet(hidden_dim=hidden_dim, num_res_blocks=num_res_blocks).to(device)
     model.load_state_dict(model_state_dict)
     model.eval()
     
@@ -222,23 +229,23 @@ def self_play_single_game(args) -> List[Tuple[GameObservation, np.ndarray, float
     
     return dataset
 
-def self_play_parallel(model, num_games: int, mcts_simulations: int, num_workers: int) -> List[Tuple[GameObservation, np.ndarray, float]]:
+def self_play_parallel(model, config: TrainConfig, num_games: int) -> List[Tuple[GameObservation, np.ndarray, float]]:
     """
     Generate self-play games in parallel using multiprocessing.
     """
-    print(f"  Using {num_workers} parallel workers")
+    print(f"  Using {config.num_workers} parallel workers")
     
     # Get model state dict (CPU)
     model_state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
     
     # Prepare arguments for each game
     args_list = [
-        (model_state_dict, mcts_simulations, i)
+        (model_state_dict, config.hidden_dim, config.num_res_blocks, config.mcts_simulations, i)
         for i in range(num_games)
     ]
     
     # Run games in parallel
-    with Pool(processes=num_workers) as pool:
+    with Pool(processes=config.num_workers) as pool:
         results = pool.map(self_play_single_game, args_list)
     
     # Flatten results
@@ -255,11 +262,11 @@ def evaluate_vs_baseline(model, device, num_games=10):
     
     # AlphaZero agent with current model
     az_network = TrainWrapper(model, device)
-    az_config = AlphaZeroConfig(iterations=200, time_limit_ms=None, dirichlet_alpha=0.0)  # No exploration
+    az_config = AlphaZeroConfig(iterations=400, time_limit_ms=None, dirichlet_alpha=0.0)  # No exploration
     az_agent = AlphaZeroAgent(config=az_config, network=az_network)
     
     # Baseline MCTS
-    mcts_config = MCTSConfig(iterations=200, time_limit_ms=None)
+    mcts_config = MCTSConfig(iterations=400, time_limit_ms=None)
     mcts_agent = MCTSAgent(config=mcts_config)
     
     # Play games
@@ -288,9 +295,10 @@ def train_loop():
     
     print(f"Using device: {device}")
     print(f"Using {config.num_workers} workers for parallel self-play")
+    print(f"Model architecture: hidden_dim={config.hidden_dim}, num_res_blocks={config.num_res_blocks}")
     
-    # Reduced model complexity
-    model = JassNet(hidden_dim=256, num_res_blocks=3).to(device)
+    # Create model with config parameters
+    model = JassNet(hidden_dim=config.hidden_dim, num_res_blocks=config.num_res_blocks).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=1e-4)
     # Cosine annealing: LR decays from initial to near-zero over training
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.iterations, eta_min=1e-5)
@@ -310,9 +318,8 @@ def train_loop():
         print("Generating self-play data...")
         new_data = self_play_parallel(
             model,
-            num_games=config.games_per_iteration,
-            mcts_simulations=config.mcts_simulations,
-            num_workers=config.num_workers
+            config,
+            num_games=config.games_per_iteration
         )
         
         # Add new data to buffer

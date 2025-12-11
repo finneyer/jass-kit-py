@@ -570,7 +570,7 @@ def main():
 
     # Load both models
     transformer_model_path = "impl/models/alpha_zero_transformer_model.pth"
-    cnn_model_path = "impl/models/alpha_zero_model_cnn.pth"
+    cnn_model_path = "impl/models/best_alpha_zero_model_cnn.pth"
     
     # Check which models are available
     has_transformer = os.path.exists(transformer_model_path)
@@ -629,7 +629,7 @@ def main():
         cnn_network = PytorchNetwork(cnn_model_path)
         cnn_agent = AlphaZeroAgent(config=az_config, network=cnn_network)
         
-        mcts_config = MCTSConfig(iterations=400, time_limit_ms=500)
+        mcts_config = MCTSConfig(iterations=100, time_limit_ms=500)
         mcts_agent = MCTSAgent(config=mcts_config)
         
         arena = Arena(nr_games_to_play=20)
