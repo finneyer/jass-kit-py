@@ -497,11 +497,17 @@ class AlphaZeroAgent(Agent):
         return rollout_state.score(state.player)
 
 class PytorchNetwork(NeuralNetwork):
-    def __init__(self, model_path: str):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # Match the architecture used in training: hidden_dim=256, num_res_blocks=3
-        self.model = JassNet(hidden_dim=256, num_res_blocks=3) 
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+    def __init__(self, model_path: str, hidden_dim: int = 256, num_res_blocks: int = 3):
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+        
+        # Match the architecture used in training
+        self.model = JassNet(hidden_dim=hidden_dim, num_res_blocks=num_res_blocks) 
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=True))
         self.model.to(self.device)
         self.model.eval()
 
@@ -509,8 +515,9 @@ class PytorchNetwork(NeuralNetwork):
         tensor_in = convert_obs_to_tensor(obs).to(self.device)
         
         with torch.no_grad():
-            policy, value = self.model(tensor_in)
+            policy, value, win_prob = self.model(tensor_in)
             
+        # Return value (score difference) for MCTS
         return policy.cpu().numpy()[0], value.item()
 
 class PytorchTransformerNetwork(NeuralNetwork):
@@ -576,7 +583,8 @@ def main():
         return
     
     # Initialize AlphaZero config
-    az_config = AlphaZeroConfig(iterations=400, time_limit_ms=500)
+    # Use fewer simulations since the network provides guidance
+    az_config = AlphaZeroConfig(iterations=200, time_limit_ms=500)
     
     # Create agents based on available models
     if has_transformer and has_cnn and False:
@@ -615,7 +623,7 @@ def main():
         print(f"Playing {arena.nr_games_to_play} games...")
         print(f"{'='*60}\n")
         
-    else:
+    elif has_cnn and True:
         # Only CNN available - play against MCTS
         print(f"Loading CNN model from {cnn_model_path}...")
         cnn_network = PytorchNetwork(cnn_model_path)
@@ -629,6 +637,23 @@ def main():
         
         print(f"\n{'='*60}")
         print(f"Starting match: CNN (Team 0) vs MCTS (Team 1)")
+        print(f"Playing {arena.nr_games_to_play} games...")
+        print(f"{'='*60}\n")
+
+    else:
+        # Play against random agent
+        if has_transformer and False:
+            print(f"Loading Transformer model from {transformer_model_path}...")
+            network = PytorchTransformerNetwork(transformer_model_path)
+        else:
+            print(f"Loading CNN model from {cnn_model_path}...")
+            network = PytorchNetwork(cnn_model_path)
+        az_agent = AlphaZeroAgent(config=az_config, network=network)
+        random_agent = AgentRandomSchieber()
+        arena = Arena(nr_games_to_play=20)
+        arena.set_players(az_agent, random_agent, az_agent, random_agent)
+        print(f"\n{'='*60}")
+        print(f"Starting match: AlphaZero Agent (Team 0) vs Random Agent (Team 1)")
         print(f"Playing {arena.nr_games_to_play} games...")
         print(f"{'='*60}\n")
     

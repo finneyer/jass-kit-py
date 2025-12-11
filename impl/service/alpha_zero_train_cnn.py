@@ -5,6 +5,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 import os
 import random
@@ -23,15 +24,15 @@ from jass.game.game_util import deal_random_hand
 
 @dataclass
 class TrainConfig:
-    iterations: int = 50
-    games_per_iteration: int = 20
-    mcts_simulations: int = 100  # Reduced for faster generation
-    batch_size: int = 32
-    learning_rate: float = 0.001
+    iterations: int = 100  # Increased from 30
+    games_per_iteration: int = 50
+    mcts_simulations: int = 300  # Reduced for faster generation, network will improve over time
+    batch_size: int = 64  # Increased for more stable gradients
+    learning_rate: float = 0.002  # Slightly higher initial LR
     checkpoint_dir: str = "impl/models"
     model_name: str = "alpha_zero_model_cnn.pth"
     replay_buffer_size: int = 50000
-    min_buffer_size: int = 1000
+    min_buffer_size: int = 2000  # Require more data before training
     train_steps: int = 100
     num_workers: int = max(1, cpu_count() - 1)  # Leave 1 core free
 
@@ -44,7 +45,8 @@ class TrainWrapper(NeuralNetwork):
         self.model.eval()
         tensor_in = convert_obs_to_tensor(obs).to(self.device)
         with torch.no_grad():
-            policy, value = self.model(tensor_in)
+            policy, value, win_prob = self.model(tensor_in)
+        # Return value (score difference) for MCTS
         return policy.cpu().numpy()[0], value.item()
 
 def self_play(agent: AlphaZeroAgent, num_games: int) -> List[Tuple[GameObservation, np.ndarray, float]]:
@@ -114,9 +116,15 @@ def self_play(agent: AlphaZeroAgent, num_games: int) -> List[Tuple[GameObservati
             
         score_diff = (points_team_0 - points_team_1) / 257.0 # Normalized with match bonus
         
+        # Binary win: did team 0 win?
+        team_0_won = 1.0 if points_team_0 > points_team_1 else 0.0
+        
         for obs, policy, player in game_history:
-            val = score_diff if (player % 2 == 0) else -score_diff
-            dataset.append((obs, policy, val))
+            val_score = score_diff if (player % 2 == 0) else -score_diff
+            # Win value from current player's perspective
+            is_team_0 = (player % 2 == 0)
+            val_win = team_0_won if is_team_0 else (1.0 - team_0_won)
+            dataset.append((obs, policy, val_score, val_win))
             
     return dataset
 
@@ -202,9 +210,15 @@ def self_play_single_game(args) -> List[Tuple[GameObservation, np.ndarray, float
         
     score_diff = (points_team_0 - points_team_1) / 257.0
     
+    # Binary win: did team 0 win?
+    team_0_won = 1.0 if points_team_0 > points_team_1 else 0.0
+    
     for obs, policy, player in game_history:
-        val = score_diff if (player % 2 == 0) else -score_diff
-        dataset.append((obs, policy, val))
+        val_score = score_diff if (player % 2 == 0) else -score_diff
+        # Win value from current player's perspective
+        is_team_0 = (player % 2 == 0)
+        val_win = team_0_won if is_team_0 else (1.0 - team_0_won)
+        dataset.append((obs, policy, val_score, val_win))
     
     return dataset
 
@@ -234,6 +248,33 @@ def self_play_parallel(model, num_games: int, mcts_simulations: int, num_workers
     
     return dataset
 
+def evaluate_vs_baseline(model, device, num_games=10):
+    """Quick evaluation against random MCTS to track progress."""
+    from jass.arena.arena import Arena
+    from impl.agents.alpha_zero import MCTSAgent, MCTSConfig
+    
+    # AlphaZero agent with current model
+    az_network = TrainWrapper(model, device)
+    az_config = AlphaZeroConfig(iterations=200, time_limit_ms=None, dirichlet_alpha=0.0)  # No exploration
+    az_agent = AlphaZeroAgent(config=az_config, network=az_network)
+    
+    # Baseline MCTS
+    mcts_config = MCTSConfig(iterations=200, time_limit_ms=None)
+    mcts_agent = MCTSAgent(config=mcts_config)
+    
+    # Play games
+    arena = Arena(nr_games_to_play=num_games, print_every_x_games=999)
+    arena.set_players(az_agent, mcts_agent, az_agent, mcts_agent)
+    arena.play_all_games()
+    
+    # Get results
+    points_team_0 = arena.points_team_0
+    points_team_1 = arena.points_team_1
+    avg_diff = np.mean(points_team_0 - points_team_1)
+    win_rate = np.sum(points_team_0 > points_team_1) / num_games
+    
+    return avg_diff, win_rate
+
 def train_loop():
     config = TrainConfig()
     
@@ -250,7 +291,9 @@ def train_loop():
     
     # Reduced model complexity
     model = JassNet(hidden_dim=256, num_res_blocks=3).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=1e-4)
+    # Cosine annealing: LR decays from initial to near-zero over training
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.iterations, eta_min=1e-5)
     
     # Replay Buffer
     replay_buffer = deque(maxlen=config.replay_buffer_size)
@@ -285,6 +328,7 @@ def train_loop():
         total_loss = 0
         total_loss_v = 0
         total_loss_p = 0
+        total_loss_w = 0
         
         for _ in range(config.train_steps):
             batch = random.sample(replay_buffer, config.batch_size)
@@ -292,35 +336,48 @@ def train_loop():
             batch_obs = []
             batch_policy = []
             batch_value = []
+            batch_win = []
             
-            for obs, pi, v in batch:
+            for obs, pi, v_score, v_win in batch:
                 batch_obs.append(convert_obs_to_tensor(obs))
                 batch_policy.append(pi)
-                batch_value.append(v)
+                batch_value.append(v_score)
+                batch_win.append(v_win)
             
             tensor_obs = torch.cat(batch_obs).to(device)
             tensor_policy = torch.tensor(np.array(batch_policy), dtype=torch.float32).to(device)
             tensor_value = torch.tensor(np.array(batch_value), dtype=torch.float32).unsqueeze(1).to(device)
+            tensor_win = torch.tensor(np.array(batch_win), dtype=torch.float32).unsqueeze(1).to(device)
             
             optimizer.zero_grad()
-            pred_policy, pred_value = model(tensor_obs)
+            pred_policy, pred_value, pred_win_prob = model(tensor_obs)
             
+            # Value loss (MSE on score difference)
             loss_v = torch.mean((tensor_value - pred_value) ** 2)
+            # Policy loss (cross entropy)
             loss_p = -torch.mean(torch.sum(tensor_policy * torch.log(pred_policy + 1e-8), dim=1))
+            # Win loss (binary cross entropy)
+            loss_w = F.binary_cross_entropy(pred_win_prob, tensor_win)
             
-            loss = loss_v + loss_p
+            # Combined loss
+            loss = loss_v + loss_p + loss_w
             loss.backward()
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
             total_loss += loss.item()
             total_loss_v += loss_v.item()
             total_loss_p += loss_p.item()
+            total_loss_w += loss_w.item()
             
         avg_loss = total_loss / config.train_steps
         avg_loss_v = total_loss_v / config.train_steps
         avg_loss_p = total_loss_p / config.train_steps
+        avg_loss_w = total_loss_w / config.train_steps
         
-        print(f"Training Loss - Total: {avg_loss:.4f} | Value: {avg_loss_v:.4f} | Policy: {avg_loss_p:.4f}")
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Training Loss - Total: {avg_loss:.4f} | Value: {avg_loss_v:.4f} | Policy: {avg_loss_p:.4f} | Win: {avg_loss_w:.4f} | LR: {current_lr:.6f}")
         
         # Save best model
         if avg_loss < best_loss:
@@ -328,6 +385,16 @@ def train_loop():
             best_model_path = os.path.join(config.checkpoint_dir, "best_" + config.model_name)
             torch.save(model.state_dict(), best_model_path)
             print(f"New best model saved! Loss: {best_loss:.4f}")
+        
+        # Step learning rate scheduler
+        scheduler.step()
+        
+        # Evaluate every 10 iterations
+        if (iteration + 1) % 10 == 0:
+            print(f"\nEvaluating against baseline MCTS...")
+            model.eval()
+            avg_diff, win_rate = evaluate_vs_baseline(model, device, num_games=10)
+            print(f"Evaluation: Avg Score Diff: {avg_diff:+.1f} | Win Rate: {win_rate:.1%}\n")
         
     save_path = os.path.join(config.checkpoint_dir, config.model_name)
     torch.save(model.state_dict(), save_path)

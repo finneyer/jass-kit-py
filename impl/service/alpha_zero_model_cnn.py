@@ -19,7 +19,7 @@ class ResidualBlock(nn.Module):
         return out
 
 class JassNet(nn.Module):
-    def __init__(self, input_shape=332, hidden_dim=256, num_res_blocks=3): 
+    def __init__(self, input_shape=332, hidden_dim=516, num_res_blocks=3): 
         """
         ResNet-style Neural Network for Jass AlphaZero.
         """
@@ -42,13 +42,22 @@ class JassNet(nn.Module):
             nn.Linear(hidden_dim // 2, 36)
         )
         
-        # Value Head
+        # Value Head (Score Difference: -1 to 1)
         self.value_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.BatchNorm1d(hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
             nn.Tanh()
+        )
+        
+        # Win Head (Win Probability: 0 to 1)
+        self.win_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()
         )
 
     def forward(self, x):
@@ -62,5 +71,6 @@ class JassNet(nn.Module):
         # Heads
         policy = F.softmax(self.policy_head(x), dim=1)
         value = self.value_head(x)
+        win_prob = self.win_head(x)
         
-        return policy, value
+        return policy, value, win_prob
