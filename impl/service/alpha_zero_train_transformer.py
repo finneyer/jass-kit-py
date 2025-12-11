@@ -26,8 +26,8 @@ from jass.game.game_util import deal_random_hand
 class TrainConfig:
     iterations: int = 50
     games_per_iteration: int = 20
-    mcts_simulations: int = 100  # Reduced from 200 for faster generation
-    batch_size: int = 32
+    mcts_simulations: int = 250  # Reduced from 200 for faster generation
+    batch_size: int = 64
     learning_rate: float = 0.0001  # Lower LR for transformer
     checkpoint_dir: str = "impl/models"
     model_name: str = "alpha_zero_transformer_model.pth"
@@ -40,7 +40,7 @@ class TrainConfig:
     use_sequence_model: bool = False  # Use JassTransformerSequence vs JassTransformer
     embed_dim: int = 128
     num_heads: int = 4
-    ff_dim: int = 512
+    ff_dim: int = 256
     num_layers: int = 3
     dropout: float = 0.1
 

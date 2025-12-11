@@ -515,7 +515,7 @@ class PytorchNetwork(NeuralNetwork):
 
 class PytorchTransformerNetwork(NeuralNetwork):
     def __init__(self, model_path: str, use_sequence_model: bool = False,
-                 embed_dim: int = 128, num_heads: int = 4, ff_dim: int = 512,
+                 embed_dim: int = 128, num_heads: int = 4, ff_dim: int = 256,
                  num_layers: int = 3, dropout: float = 0.1):
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -579,7 +579,7 @@ def main():
     az_config = AlphaZeroConfig(iterations=400, time_limit_ms=500)
     
     # Create agents based on available models
-    if has_transformer and has_cnn:
+    if has_transformer and has_cnn and False:
         # Both models available - CNN vs Transformer
         print(f"Loading Transformer model from {transformer_model_path}...")
         transformer_network = PytorchTransformerNetwork(transformer_model_path)
@@ -598,7 +598,7 @@ def main():
         print(f"Playing {arena.nr_games_to_play} games...")
         print(f"{'='*60}\n")
         
-    elif has_transformer:
+    elif has_transformer and False:
         # Only transformer available - play against MCTS
         print(f"Loading Transformer model from {transformer_model_path}...")
         transformer_network = PytorchTransformerNetwork(transformer_model_path)
