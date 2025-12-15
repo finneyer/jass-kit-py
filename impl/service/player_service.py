@@ -6,7 +6,7 @@ logging.basicConfig(level=logging.DEBUG)
 
 app = PlayerServiceApp('player_service')
 
-config_1 = MCTSConfig(iterations=1000, time_limit_ms=1000)
+config_1 = MCTSConfig(iterations=5000, time_limit_ms=5000)
 config_2 = MCTSConfig(iterations=500, time_limit_ms=250)
 
 
