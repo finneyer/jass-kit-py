@@ -29,7 +29,6 @@ class MCTSConfig:
     time_limit_ms: Optional[int] = 150
     c_uct: float = 1.414  # Exploration constant
     rollout_depth: int = 10  # Max number of moves in a rollout
-    determinization_samples: int = 8  # Reuse this many rollouts per sampled world
     use_priors: bool = True  # Whether to use priors from a heuristic (e.g., RuleBasedAgent)
 
 
