@@ -5,7 +5,6 @@ from jass.agents.agent_cheating import AgentCheating
 from jass.game.game_state import GameState
 from jass.game.rule_schieber import RuleSchieber
 from jass.game.game_sim import GameSim
-from jass.agents.agent_random_schieber import AgentRandomSchieber
 from jass.agents.agent_cheating_random_schieber import AgentCheatingRandomSchieber
 from jass.arena.arena import Arena
 
@@ -48,7 +47,6 @@ class AgentCheatingMinimax(AgentCheating):
         for next_card in valid_cards_next:
             scores.append(self.minimax(new_state, next_card, depth + 1))
 
-        # Decide if we maximize or minimize depending on team
         if next_player % 2 == state.player % 2:
             return max(scores)
         else:
@@ -69,7 +67,6 @@ class AgentCheatingMinimax(AgentCheating):
 def main():
     logging.basicConfig(level=logging.WARNING)
 
-    # setup the arena
     arena = Arena(nr_games_to_play=1000, save_filename='arena_games', cheating_mode=True)
     random_cheating_player = AgentCheatingRandomSchieber()
     cheating_minimax_player = AgentCheatingMinimax()

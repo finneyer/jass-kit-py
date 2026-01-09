@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Tuple
 import time
 import os
 import sys
@@ -12,22 +12,21 @@ import numpy as np
 import torch
 
 from jass.agents.agent import Agent
-from jass.game.const import PUSH, next_player, partner_player, card_values
+from jass.game.const import next_player
 from jass.game.game_observation import GameObservation
-from jass.game.game_rule import GameRule
-from jass.game.game_util import convert_one_hot_encoded_cards_to_int_encoded_list,     convert_int_encoded_cards_to_str_encoded
+from jass.game.game_util import convert_one_hot_encoded_cards_to_int_encoded_list
 from jass.game.rule_schieber import RuleSchieber
 from jass.agents.agent_random_schieber import AgentRandomSchieber
 from jass.arena.arena import Arena
-from impl.service.alpha_zero_model_cnn import JassNet
-from impl.service.alpha_zero_model_transformer import JassTransformer, JassTransformerSequence
-from impl.service.alpha_zero_utils import convert_obs_to_tensor
+from impl.utils.alpha_zero_model_cnn import JassNet
+from impl.utils.alpha_zero_model_transformer import JassTransformer, JassTransformerSequence
+from impl.utils.alpha_zero_utils import convert_obs_to_tensor
 import logging
 from impl.agents.agent_monte_carlo import MCTSAgent, MCTSConfig
 
 # Import TrainConfig to allow unpickling of saved checkpoints
 try:
-    from impl.service.alpha_zero_train_transformer import TrainConfig as TransformerTrainConfig
+    from impl.utils import TrainConfig as TransformerTrainConfig
 except ImportError:
     TransformerTrainConfig = None
 

@@ -68,26 +68,22 @@ class AgentCheatingMinimaxNTricks(AgentCheating):
         return best_card
 
     def minimax(self,state: GameState,card_to_play: int,depth: int,start_trick_count=None,alpha=-float('inf'),beta=float('inf')) -> int:
-        # Simulate playing the given card
         sim = GameSim(self.rule)
         sim.init_from_state(copy.deepcopy(state))
         sim.action_play_card(card_to_play)
         new_state = sim.state
 
-        # Track trick progression
         if start_trick_count is None:
             start_trick_count = state.nr_tricks
 
         tricks_played = new_state.nr_tricks - start_trick_count
 
-        # Stop condition
         if tricks_played >= self.n_tricks or new_state.nr_played_cards == 36:
             return self.evaluate_heuristic(new_state, state.player)
 
         next_player = new_state.player
         valid_cards_next = np.flatnonzero(self.rule.get_valid_cards_from_state(new_state))
 
-        # Decide maximizing or minimizing mode
         is_maximizing = (next_player % 2) == (state.player % 2)
 
         if is_maximizing:
@@ -97,7 +93,7 @@ class AgentCheatingMinimaxNTricks(AgentCheating):
                 value = max(value, cand)
                 alpha = max(alpha, value)
                 if beta <= alpha:
-                    break  # Beta cut-off
+                    break
             return value
         else:
             value = float('inf')
@@ -106,7 +102,7 @@ class AgentCheatingMinimaxNTricks(AgentCheating):
                 value = min(value, cand)
                 beta = min(beta, value)
                 if beta <= alpha:
-                    break  # Alpha cut-off
+                    break
             return value
 
     def evaluate_score(self, state: GameState, my_player_id: int, start_trick_count: int) -> int:
@@ -133,27 +129,22 @@ class AgentCheatingMinimaxNTricks(AgentCheating):
         my_team = my_player_id % 2
         opp_team = 1 - my_team
 
-        # 1) current points differential
         point_diff = int(state.points[my_team]) - int(state.points[opp_team])
 
-        # 2) tricks already won by my team
         tricks_won = sum(
             1 for w in state.trick_winner[:state.nr_tricks]
             if w != -1 and (w % 2) == my_team
         )
 
-        # 3) remaining trumps in hand (only if a suit trump 0..3 is active)
         hand = state.hands[state.player, :]
         if state.trump is not None and 0 <= state.trump < 4:
             trumps_left = int(np.sum(hand * color_masks[state.trump, :]))
         else:
             trumps_left = 0
 
-        # 4) remaining hand "value" under current trump mode (works for suits + OBE/UNE)
         hand_cards = np.flatnonzero(hand)
         hand_value = float(np.sum(card_values[state.trump, hand_cards])) if hand_cards.size > 0 else 0.0
 
-        # Combine with reasonable weights (tune if you like)
         return (1.0 * point_diff) + (8.0 * tricks_won) + (2.0 * trumps_left) + (0.3 * hand_value)
 
 
@@ -161,7 +152,6 @@ class AgentCheatingMinimaxNTricks(AgentCheating):
 def main():
     logging.basicConfig(level=logging.WARNING)
 
-    # setup the arena
     arena = Arena(nr_games_to_play=30, save_filename='arena_games', cheating_mode=True)
     random_cheating_player = AgentCheatingRandomSchieber()
     cheating_minimax_player = AgentCheatingMinimaxNTricks(n_tricks=2)

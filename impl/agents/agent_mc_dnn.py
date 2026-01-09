@@ -59,24 +59,24 @@ class MCTSConfig:
     """Configuration for the MCTS agent."""
     iterations: int = 200
     time_limit_ms: Optional[int] = 150
-    c_uct: float = 1.414  # Exploration constant
-    rollout_depth: int = 10  # Max number of moves in a rollout
-    determinization_samples: int = 8  # Reuse this many rollouts per sampled world
-    use_priors: bool = True  # Whether to use priors from a heuristic (e.g., RuleBasedAgent)
+    c_uct: float = 1.414
+    rollout_depth: int = 10
+    determinization_samples: int = 8
+    use_priors: bool = True
 
 
 @dataclass
 class MCTSNode:
     """A node in the Monte Carlo search tree."""
     parent: Optional[MCTSNode] = None
-    children: Dict[int, MCTSNode] = field(default_factory=dict)  # action -> MCTSNode
+    children: Dict[int, MCTSNode] = field(default_factory=dict)
     visits: int = 0
-    value: float = 0.0  # Mean value from the perspective of the player to move
-    prior: float = 0.0  # Prior probability of selecting this node's action
-    action: Optional[int] = None  # The action that led to this node
+    value: float = 0.0
+    prior: float = 0.0
+    action: Optional[int] = None
     player_to_move: int = -1
     untried_actions: List[int] = field(default_factory=list)
-    state_key: Optional[Tuple | int] = None  # For transposition table
+    state_key: Optional[Tuple | int] = None
 
 
 class GameStateAdapter:
@@ -178,7 +178,6 @@ class GameStateAdapter:
 
         score = self.points[player_team] - self.points[opponent_team]
 
-        # check if a team made the match (only valid at terminal state)
         if self.nr_tricks == 9:
             if self.points[player_team] > 0 and self.points[opponent_team] == 0:
                 score += 100
@@ -205,16 +204,11 @@ class MCTSAgent_DNN(Agent):
 
         base_dir = Path(__file__).resolve().parent
 
-        # --- DNN Model Loading ---
         if model_path is None:
-            # Default path to your trained model
             model_path = base_dir / "../models/dnn_trump_model_v7.pth"
 
-        # 1. Instantiate the model
         self.trump_model = TrumpSelectionDNN()
 
-        # 2. Load the trained weights
-        # IMPORTANT: map_location ensures it loads correctly regardless of CPU/GPU
         try:
             self.trump_model.load_state_dict(
                 torch.load(model_path, map_location=torch.device('cpu'))
@@ -224,9 +218,7 @@ class MCTSAgent_DNN(Agent):
             print("Please ensure the model file exists at the specified path.")
             # Fallback or error handling can be added here
 
-        # 3. Set model to evaluation mode (crucial for Dropout layers)
         self.trump_model.eval()
-        # --- End DNN Model Loading ---
 
 
     def action_trump(self, obs: GameObservation) -> int:
@@ -234,46 +226,32 @@ class MCTSAgent_DNN(Agent):
         Predict the trump using the trained DNN model, correctly mapping the PUSH index
         and adhering to the forehand/rearhand rules.
         """
-        # ... (Input preparation) ...
         hand_vector = np.array(obs.hand, dtype=np.float32)
         forehand_feature = np.array([1.0 if obs.forehand == 1 else 0.0], dtype=np.float32)
 
         X_input_np = np.concatenate([hand_vector, forehand_feature]).reshape(1, -1)
         X_input_tensor = torch.from_numpy(X_input_np).float()
 
-        # 1. Make prediction (Output index 0-6)
         with torch.no_grad():
             Y_logits = self.trump_model(X_input_tensor)
             predicted_label_index = torch.argmax(Y_logits, dim=1).item()
 
-        # 2. Map the predicted index (0-6) to the Jass constant (0-5, or 10)
+        DNN_PUSH_INDEX = 6
 
-        DNN_PUSH_INDEX = 6  # The index your model was trained to output for PUSH
+        trump_value = 0
 
-        trump_value = 0  # Default to a safe, legal choice (DIAMONDS)
 
-        # Case A: Model predicts a standard trump (0-5)
         if predicted_label_index != DNN_PUSH_INDEX:
-            trump_value = predicted_label_index  # Directly 0-5. This is always legal.
+            trump_value = predicted_label_index
 
-        # Case B: Model predicts PUSH (index 6)
         else:
-            # Subcase B1: It's the first call (forehand has not declared)
             if obs.forehand == -1:
-                # The arena expects the forehand player's action.
-                # PUSH (10) IS legal as a move, though it passes the right to the partner.
-                trump_value = PUSH  # Returns 10. Legal.
+                trump_value = PUSH
 
-            # Subcase B2: It's the second call (forehand passed, obs.forehand == 0)
             elif obs.forehand == 0:
-                # The player is now the rearhand player (partner). The rule mandates a non-PUSH choice (0-5).
-                # The DNN's PUSH prediction must be overridden to a non-PUSH value (e.g., DIAMONDS=0).
-                trump_value = 0  # Cannot return PUSH (10). Illegal move, must choose 0-5.
+                trump_value = 0
 
-            # Subcase B3: Trump was already declared (obs.forehand == 1, should not happen in trump selection phase)
             elif obs.forehand == 1:
-                # This state implies trump was already declared. If this code runs, it's an API misuse.
-                # Safest is to choose 0.
                 trump_value = 0
 
         return trump_value
@@ -338,7 +316,6 @@ class MCTSAgent_DNN(Agent):
 
         iters = 0
         while True:
-            # Budget check
             if deadline is None:
                 if iters >= self.config.iterations:
                     break
@@ -346,31 +323,24 @@ class MCTSAgent_DNN(Agent):
                 if time.perf_counter() >= deadline:
                     break
 
-            # One determinization per full simulation
             hands = self._sample_hidden_state(obs)
 
-            # INIT STATE FOR THIS SIMULATION
             state = GameStateAdapter(obs, hands)
             node = root
 
-            # SELECTION
             while not node.untried_actions and node.children:
                 node = self._select(node)
                 state.step(node.action)
 
-            # EXPANSION
             if node.untried_actions:
                 action = int(self._rng.choice(node.untried_actions))
                 state.step(action)
                 node = self._expand(node, action, state)
 
-            # SIMULATION (Rollout)
             reward = self._rollout(state, root_player=obs.player)
 
-            # BACKPROPAGATION
             self._backpropagate(node, reward, root_player=obs.player)
 
-            # Count this completed simulation
             iters += 1
 
         return root
@@ -386,7 +356,6 @@ class MCTSAgent_DNN(Agent):
             if child.visits == 0:
                 score = np.inf
             else:
-                # Convert child's value to current node player's team perspective for selection.
                 same_team = (child.player_to_move % 2) == (node.player_to_move % 2)
                 exploit_raw = child.value / child.visits
                 exploit = exploit_raw if same_team else -exploit_raw
@@ -403,7 +372,6 @@ class MCTSAgent_DNN(Agent):
         """
         node.untried_actions.remove(action)
         new_node = MCTSNode(parent=node, action=action, player_to_move=state.player)
-        # Initialize child untried actions from the current state
         new_node.untried_actions = state.valid_actions()
         node.children[action] = new_node
         return new_node
@@ -413,14 +381,13 @@ class MCTSAgent_DNN(Agent):
         Simulate to the end of the game and return the final normalized score
         from the root player's team perspective.
         """
-        # Continue until terminal state (full game simulated)
         while not state.is_terminal():
             hand = state.hands[state.player]
             valid_cards = self._rule.get_valid_cards(hand, state.current_trick, state.nr_cards_in_trick, state.trump)
             valid_indices = np.flatnonzero(valid_cards)
             if len(valid_indices) == 0:
-                # Determinization inconsistency: stop and evaluate current score
                 break
+
             action = self._rng.choice(valid_indices)
             state.step(action)
         return state.score(root_player)
@@ -431,7 +398,6 @@ class MCTSAgent_DNN(Agent):
         """
         while node is not None:
             node.visits += 1
-            # reward is from the root player's team perspective
             if (node.player_to_move % 2) != (root_player % 2):
                 node.value -= reward
             else:
@@ -442,7 +408,6 @@ class MCTSAgent_DNN(Agent):
         """
         Generates a random, consistent assignment of cards for hidden hands.
         """
-        # Known cards: our hand and all played cards
         known = np.zeros(36, dtype=np.int32)
         known[convert_one_hot_encoded_cards_to_int_encoded_list(obs.hand)] = 1
 
@@ -450,7 +415,7 @@ class MCTSAgent_DNN(Agent):
             for card in obs.tricks[t]:
                 if card != -1:
                     known[card] = 1
-        # include current trick cards
+
         if obs.nr_tricks < 9 and obs.current_trick is not None:
             for k in range(obs.nr_cards_in_trick):
                 card = obs.current_trick[k]
@@ -463,7 +428,6 @@ class MCTSAgent_DNN(Agent):
         hands = np.zeros((4, 36), dtype=np.int32)
         hands[obs.player] = obs.hand
 
-        # Determine how many cards each opponent should have left
         counts_needed = [0, 0, 0, 0]
         first = int(obs.trick_first_player[obs.nr_tricks]) if obs.nr_tricks < 9 else 0
         played_this_trick_players = set()
@@ -472,14 +436,14 @@ class MCTSAgent_DNN(Agent):
 
         for p in range(4):
             have = int(np.sum(hands[p]))
-            # expected remaining cards
+
             expected = 9 - obs.nr_tricks - (1 if p in played_this_trick_players else 0)
             if p == obs.player:
                 expected = have
             need = max(0, expected - have)
             counts_needed[p] = need
 
-        # Assign unknown cards to other players according to required counts
+
         pos = 0
         for p in range(4):
             if p == obs.player:
@@ -491,7 +455,7 @@ class MCTSAgent_DNN(Agent):
                 if take:
                     hands[p, take] = 1
 
-        # Any remaining unknown cards (due to mismatches) are distributed round-robin
+
         while pos < len(unknown_cards):
             for p in range(4):
                 if p == obs.player:
@@ -508,11 +472,8 @@ class MCTSAgent_DNN(Agent):
 def main():
     logging.basicConfig(level=logging.WARNING)
 
-    # setup the arena
     arena = Arena(nr_games_to_play=25)
     player = AgentRandomSchieber()
-
-    # Instantiate your custom agent pointing to the trained DNN model path
     model_path = Path(__file__).resolve().parent / "../models/dnn_trump_model_v7.pth"
 
     my_player = MCTSAgent_DNN(
