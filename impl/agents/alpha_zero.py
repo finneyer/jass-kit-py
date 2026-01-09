@@ -15,8 +15,7 @@ from jass.agents.agent import Agent
 from jass.game.const import PUSH, next_player, partner_player, card_values
 from jass.game.game_observation import GameObservation
 from jass.game.game_rule import GameRule
-from jass.game.game_util import convert_one_hot_encoded_cards_to_int_encoded_list, \
-    convert_int_encoded_cards_to_str_encoded
+from jass.game.game_util import convert_one_hot_encoded_cards_to_int_encoded_list,     convert_int_encoded_cards_to_str_encoded
 from jass.game.rule_schieber import RuleSchieber
 from jass.agents.agent_random_schieber import AgentRandomSchieber
 from jass.arena.arena import Arena
@@ -88,7 +87,6 @@ class AlphaZeroNode:
     prior: float = 0.0
     player_to_move: int = -1
     is_expanded: bool = False
-    # Cached policy from the network, used to instantiate children lazily
     policy_probs: Optional[np.ndarray] = None
 
     @property
@@ -128,7 +126,6 @@ class GameStateAdapter:
 
     def clone(self) -> GameStateAdapter:
         """Return a deep copy of the current game state."""
-        # create a new, empty object and copy over the state
         new_state = GameStateAdapter.__new__(GameStateAdapter)
         new_state._rule = self._rule
         new_state.player = self.player
@@ -154,13 +151,11 @@ class GameStateAdapter:
         """
         Apply an action and update the game state.
         """
-        # card is played
         self.hands[self.player, action] = 0
         self.current_trick[self.nr_cards_in_trick] = action
         self.nr_cards_in_trick += 1
 
         if self.nr_cards_in_trick == 4:
-            # trick is complete
             self.tricks[self.nr_tricks] = self.current_trick
             self.trick_winner[self.nr_tricks] = self._rule.calc_winner(self.current_trick, self.trick_first_player[self.nr_tricks], self.trump)
             self.trick_points[self.nr_tricks] = self._rule.calc_points(self.current_trick, self.nr_tricks == 8, self.trump)
@@ -176,7 +171,6 @@ class GameStateAdapter:
             self.player = winner
             if self.nr_tricks < 9:
                 self.trick_first_player[self.nr_tricks] = self.player
-                # rebind to the next trick row and clear
                 self.current_trick = self.tricks[self.nr_tricks]
                 self.current_trick.fill(-1)
         else:
@@ -243,8 +237,6 @@ class AlphaZeroAgent(Agent):
         self._rng = np.random.default_rng()
 
     def action_trump(self, obs: GameObservation) -> int:
-        # For simplicity, use a basic heuristic or random for trump selection
-        # as AlphaZero is typically applied to the play phase here.
         return AgentRandomSchieber().action_trump(obs)
 
     def action_play_card(self, obs: GameObservation) -> int:
@@ -271,22 +263,17 @@ class AlphaZeroAgent(Agent):
     def _search(self, obs: GameObservation) -> AlphaZeroNode:
         root = AlphaZeroNode(parent=None, prior=0.0, player_to_move=obs.player)
         
-        # Initial expansion of root
         policy, _ = self.network.predict(obs)
         
-        # Mask invalid actions
         valid_actions = self._rule.get_valid_cards_from_obs(obs)
         valid_mask = np.flatnonzero(valid_actions)
         masked_policy = np.zeros_like(policy)
 
-        # Copy probabilities only for valid moves
         masked_policy[valid_mask] = policy[valid_mask]
 
-        # Re-normalize to sum to 1
         if masked_policy.sum() > 0:
             masked_policy /= masked_policy.sum()
         else:
-            # Fallback if network predicts 0 for all valid moves
             masked_policy[valid_mask] = 1.0 / len(valid_mask)
             
         root.policy_probs = masked_policy
@@ -305,12 +292,10 @@ class AlphaZeroAgent(Agent):
                 if time.perf_counter() >= deadline:
                     break
 
-            # Determinize
             hands = self._sample_hidden_state(obs)
             state = GameStateAdapter(obs, hands)
             node = root
 
-            # Selection
             while node.is_expanded:
                 valid_actions = state.valid_actions()
                 
@@ -322,13 +307,10 @@ class AlphaZeroAgent(Agent):
                 action, node = self._select(node, valid_actions, state.player)
                 state.step(action)
 
-            # Expansion and Evaluation
             if not state.is_terminal():
                 leaf_obs = state.to_observation()
                 policy, value = self.network.predict(leaf_obs)
                 
-                # Mask and renormalize policy for valid actions
-                # Use state.valid_actions() which is already computed correctly
                 valid_actions_list = state.valid_actions()
                 masked_policy_leaf = np.zeros_like(policy)
                 
@@ -337,11 +319,8 @@ class AlphaZeroAgent(Agent):
                     if masked_policy_leaf.sum() > 0:
                         masked_policy_leaf /= masked_policy_leaf.sum()
                     else:
-                        # Network predicted 0 for all valid moves, use uniform
                         masked_policy_leaf[valid_actions_list] = 1.0 / len(valid_actions_list)
                 else:
-                    # No valid actions but not terminal - shouldn't happen, but handle gracefully
-                    # Just use uniform over all actions as fallback
                     masked_policy_leaf = np.ones_like(policy) / len(policy)
                 
                 if self.config.use_rollouts:
@@ -350,7 +329,6 @@ class AlphaZeroAgent(Agent):
                         rollout_value_sum += self._rollout(state)
                     rollout_value = rollout_value_sum / self.config.rollout_count
                     
-                    # Mix network value and rollout value
                     value = (1 - self.config.rollout_mixing) * value + self.config.rollout_mixing * rollout_value
                 
                 node.policy_probs = masked_policy_leaf
@@ -358,15 +336,14 @@ class AlphaZeroAgent(Agent):
             else:
                 value = state.score(state.player)
 
-            # Backpropagation
             self._backpropagate(node, value, state.player)
 
             iters += 1
 
         return root
-
+    
     def _ensure_children(self, node: AlphaZeroNode, valid_actions: List[int]):
-        """Ensures that child nodes exist for all valid actions."""
+        """Ensure all valid actions are in children."""
         for action in valid_actions:
             if action not in node.children:
                 prior = node.policy_probs[action] if node.policy_probs is not None else 0.0
@@ -416,7 +393,6 @@ class AlphaZeroAgent(Agent):
         """
         Generates a random, consistent assignment of cards for hidden hands.
         """
-        # Known cards: our hand and all played cards
         known = np.zeros(36, dtype=np.int32)
         known[convert_one_hot_encoded_cards_to_int_encoded_list(obs.hand)] = 1
 
@@ -424,7 +400,7 @@ class AlphaZeroAgent(Agent):
             for card in obs.tricks[t]:
                 if card != -1:
                     known[card] = 1
-        # include current trick cards
+        
         if obs.nr_tricks < 9 and obs.current_trick is not None:
             for k in range(obs.nr_cards_in_trick):
                 card = obs.current_trick[k]
@@ -437,9 +413,6 @@ class AlphaZeroAgent(Agent):
         hands = np.zeros((4, 36), dtype=np.int32)
         hands[obs.player] = obs.hand
 
-        # Determine how many cards each opponent should have left
-        # Each player starts with 9 cards. Each completed trick consumes 1 card per player.
-        # In the current trick, some players may already have played.
         counts_needed = [0, 0, 0, 0]
         first = int(obs.trick_first_player[obs.nr_tricks]) if obs.nr_tricks < 9 else 0
         played_this_trick_players = set()
@@ -448,16 +421,12 @@ class AlphaZeroAgent(Agent):
 
         for p in range(4):
             have = int(np.sum(hands[p]))
-            # expected remaining cards
             expected = 9 - obs.nr_tricks - (1 if p in played_this_trick_players else 0)
             if p == obs.player:
-                # sanity: our observed hand size should equal expected
-                # if mismatch due to data, clamp to observed
                 expected = have
             need = max(0, expected - have)
             counts_needed[p] = need
 
-        # Assign unknown cards to other players according to required counts
         pos = 0
         for p in range(4):
             if p == obs.player:
@@ -469,7 +438,6 @@ class AlphaZeroAgent(Agent):
                 if take:
                     hands[p, take] = 1
 
-        # Any remaining unknown cards (due to mismatches) are distributed round-robin
         while pos < len(unknown_cards):
             for p in range(4):
                 if p == obs.player:
@@ -505,7 +473,6 @@ class PytorchNetwork(NeuralNetwork):
         else:
             self.device = torch.device("cpu")
         
-        # Match the architecture used in training
         self.model = JassNet(hidden_dim=hidden_dim, num_res_blocks=num_res_blocks) 
         self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=True))
         self.model.to(self.device)
@@ -517,7 +484,6 @@ class PytorchNetwork(NeuralNetwork):
         with torch.no_grad():
             policy, value, win_prob = self.model(tensor_in)
             
-        # Return value (score difference) for MCTS
         return policy.cpu().numpy()[0], value.item()
 
 class PytorchTransformerNetwork(NeuralNetwork):
@@ -531,10 +497,8 @@ class PytorchTransformerNetwork(NeuralNetwork):
         else:
             self.device = torch.device("cpu")
         
-        # Load state dict (weights only, no checkpoints)
         state_dict = torch.load(model_path, map_location=self.device, weights_only=True)
         
-        # Create model with matching architecture
         if use_sequence_model:
             self.model = JassTransformerSequence(
                 embed_dim=embed_dim,
@@ -568,11 +532,9 @@ class PytorchTransformerNetwork(NeuralNetwork):
 def main():
     logging.basicConfig(level=logging.INFO)
 
-    # Load both models
     transformer_model_path = "impl/models/alpha_zero_transformer_model.pth"
     cnn_model_path = "impl/models/best_alpha_zero_model_cnn.pth"
     
-    # Check which models are available
     has_transformer = os.path.exists(transformer_model_path)
     has_cnn = os.path.exists(cnn_model_path)
     
@@ -582,13 +544,9 @@ def main():
         print(f"  CNN: {cnn_model_path}")
         return
     
-    # Initialize AlphaZero config
-    # Use fewer simulations since the network provides guidance
     az_config = AlphaZeroConfig(iterations=200, time_limit_ms=500)
     
-    # Create agents based on available models
     if has_transformer and has_cnn and False:
-        # Both models available - CNN vs Transformer
         print(f"Loading Transformer model from {transformer_model_path}...")
         transformer_network = PytorchTransformerNetwork(transformer_model_path)
         transformer_agent = AlphaZeroAgent(config=az_config, network=transformer_network)
@@ -597,7 +555,6 @@ def main():
         cnn_network = PytorchNetwork(cnn_model_path)
         cnn_agent = AlphaZeroAgent(config=az_config, network=cnn_network)
         
-        # Setup Arena: Transformer (Team 0) vs CNN (Team 1)
         arena = Arena(nr_games_to_play=20)
         arena.set_players(transformer_agent, cnn_agent, transformer_agent, cnn_agent)
         
@@ -607,7 +564,6 @@ def main():
         print(f"{'='*60}\n")
         
     elif has_transformer and False:
-        # Only transformer available - play against MCTS
         print(f"Loading Transformer model from {transformer_model_path}...")
         transformer_network = PytorchTransformerNetwork(transformer_model_path)
         transformer_agent = AlphaZeroAgent(config=az_config, network=transformer_network)
@@ -624,7 +580,6 @@ def main():
         print(f"{'='*60}\n")
         
     elif has_cnn and True:
-        # Only CNN available - play against MCTS
         print(f"Loading CNN model from {cnn_model_path}...")
         cnn_network = PytorchNetwork(cnn_model_path)
         cnn_agent = AlphaZeroAgent(config=az_config, network=cnn_network)
@@ -641,7 +596,6 @@ def main():
         print(f"{'='*60}\n")
 
     else:
-        # Play against random agent
         if has_transformer and False:
             print(f"Loading Transformer model from {transformer_model_path}...")
             network = PytorchTransformerNetwork(transformer_model_path)

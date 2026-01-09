@@ -28,16 +28,11 @@ class JassTransformer(nn.Module):
         """
         super(JassTransformer, self).__init__()
         
-        # Input projection to transformer dimension
         self.input_proj = nn.Linear(input_dim, embed_dim)
         self.input_norm = nn.LayerNorm(embed_dim)
         
-        # Positional encoding (learnable)
-        # We treat the flattened input as a "sequence" by chunking it
-        # For simplicity, we use a single-token representation with positional bias
         self.pos_encoding = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
         
-        # Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -45,19 +40,17 @@ class JassTransformer(nn.Module):
             dropout=dropout,
             activation="gelu",
             batch_first=True,
-            norm_first=True  # Pre-norm architecture (more stable)
+            norm_first=True
         )
         self.transformer = nn.TransformerEncoder(
             encoder_layer,
             num_layers=num_layers,
-            enable_nested_tensor=False  # Avoid compatibility issues
+            enable_nested_tensor=False
         )
         
-        # Output normalization and pooling
         self.output_norm = nn.LayerNorm(embed_dim)
         self.output_dropout = nn.Dropout(dropout)
         
-        # Policy Head (predicts probability for each of 36 cards)
         self.policy_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
@@ -65,13 +58,12 @@ class JassTransformer(nn.Module):
             nn.Linear(embed_dim, 36)
         )
         
-        # Value Head (predicts game outcome from current player's perspective)
         self.value_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(embed_dim // 2, 1),
-            nn.Tanh()  # Output in [-1, 1]
+            nn.Tanh()
         )
         
         self._init_weights()
@@ -100,24 +92,18 @@ class JassTransformer(nn.Module):
         """
         batch_size = x.shape[0]
         
-        # Project input to embedding dimension
-        x = self.input_proj(x)  # (batch_size, embed_dim)
+        x = self.input_proj(x)
         x = self.input_norm(x)
         
-        # Add positional encoding and reshape for transformer
-        # Treat as a sequence of length 1 (we could chunk the input for a real sequence)
-        x = x.unsqueeze(1)  # (batch_size, 1, embed_dim)
+        x = x.unsqueeze(1)
         x = x + self.pos_encoding
         
-        # Apply transformer
-        x = self.transformer(x)  # (batch_size, 1, embed_dim)
+        x = self.transformer(x)
         
-        # Pool and normalize
-        x = x.squeeze(1)  # (batch_size, embed_dim)
+        x = x.squeeze(1)
         x = self.output_norm(x)
         x = self.output_dropout(x)
         
-        # Compute policy and value
         policy_logits = self.policy_head(x)
         policy = F.softmax(policy_logits, dim=1)
         value = self.value_head(x)
@@ -140,31 +126,15 @@ class JassTransformerSequence(nn.Module):
     ):
         super(JassTransformerSequence, self).__init__()
         
-        # Feature chunks:
-        # - Hand: 36 features
-        # - Player 0 history: 36 features
-        # - Player 1 history: 36 features  
-        # - Player 2 history: 36 features
-        # - Player 3 history: 36 features
-        # - Current trick pos 0: 36 features
-        # - Current trick pos 1: 36 features
-        # - Current trick pos 2: 36 features
-        # - Current trick pos 3: 36 features
-        # - Trump + global: 8 features
-        # Total: 9*36 + 8 = 332
-        
         self.chunk_sizes = [36] * 9 + [8]
         self.num_chunks = len(self.chunk_sizes)
         
-        # Embedding for each chunk type
         self.chunk_embeddings = nn.ModuleList([
             nn.Linear(size, embed_dim) for size in self.chunk_sizes
         ])
         
-        # Positional encoding for chunk positions
         self.pos_embedding = nn.Embedding(self.num_chunks, embed_dim)
         
-        # Transformer
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -183,7 +153,6 @@ class JassTransformerSequence(nn.Module):
         self.output_norm = nn.LayerNorm(embed_dim)
         self.output_dropout = nn.Dropout(dropout)
         
-        # Policy and value heads
         self.policy_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
@@ -224,7 +193,6 @@ class JassTransformerSequence(nn.Module):
         """
         batch_size = x.shape[0]
         
-        # Split input into chunks
         chunks = []
         offset = 0
         for i, size in enumerate(self.chunk_sizes):
@@ -233,23 +201,18 @@ class JassTransformerSequence(nn.Module):
             chunks.append(chunk_emb)
             offset += size
         
-        # Stack chunks into sequence
-        seq = torch.stack(chunks, dim=1)  # (batch_size, num_chunks, embed_dim)
+        seq = torch.stack(chunks, dim=1)
         
-        # Add positional encoding
         positions = torch.arange(self.num_chunks, device=x.device)
-        pos_emb = self.pos_embedding(positions).unsqueeze(0)  # (1, num_chunks, embed_dim)
+        pos_emb = self.pos_embedding(positions).unsqueeze(0)
         seq = seq + pos_emb
         
-        # Apply transformer
-        seq = self.transformer(seq)  # (batch_size, num_chunks, embed_dim)
+        seq = self.transformer(seq)
         
-        # Global average pooling over sequence
-        pooled = seq.mean(dim=1)  # (batch_size, embed_dim)
+        pooled = seq.mean(dim=1)
         pooled = self.output_norm(pooled)
         pooled = self.output_dropout(pooled)
         
-        # Compute policy and value
         policy_logits = self.policy_head(pooled)
         policy = F.softmax(policy_logits, dim=1)
         value = self.value_head(pooled)

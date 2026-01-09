@@ -8,8 +8,7 @@ from jass.agents.agent import Agent
 from jass.game.const import PUSH, next_player, partner_player, card_values
 from jass.game.game_observation import GameObservation
 from jass.game.game_rule import GameRule
-from jass.game.game_util import convert_one_hot_encoded_cards_to_int_encoded_list, \
-    convert_int_encoded_cards_to_str_encoded
+from jass.game.game_util import convert_one_hot_encoded_cards_to_int_encoded_list,     convert_int_encoded_cards_to_str_encoded
 from jass.game.rule_schieber import RuleSchieber
 from jass.agents.agent_random_schieber import AgentRandomSchieber
 from jass.arena.arena import Arena
@@ -19,28 +18,26 @@ import logging
 @dataclass
 class MCTSConfig:
     """Configuration for the MCTS agent."""
-    # TODO: Finalize and document configuration options
     iterations: int = 200
     time_limit_ms: Optional[int] = 150
-    c_uct: float = 1.414  # Exploration constant
-    rollout_depth: int = 10  # Max number of moves in a rollout
-    determinization_samples: int = 8  # Reuse this many rollouts per sampled world
-    use_priors: bool = True  # Whether to use priors from a heuristic (e.g., RuleBasedAgent)
+    c_uct: float = 1.414
+    rollout_depth: int = 10
+    determinization_samples: int = 8
+    use_priors: bool = True
 
 
 @dataclass
 class MCTSNode:
     """A node in the Monte Carlo search tree."""
-    # TODO: Implement state_key generation (e.g., Zobrist hashing) for transposition table
     parent: Optional[MCTSNode] = None
-    children: Dict[int, MCTSNode] = field(default_factory=dict)  # action -> MCTSNode
+    children: Dict[int, MCTSNode] = field(default_factory=dict)
     visits: int = 0
-    value: float = 0.0  # Mean value from the perspective of the player to move
-    prior: float = 0.0  # Prior probability of selecting this node's action
-    action: Optional[int] = None  # The action that led to this node
+    value: float = 0.0
+    prior: float = 0.0
+    action: Optional[int] = None
     player_to_move: int = -1
     untried_actions: List[int] = field(default_factory=list)
-    state_key: Optional[Tuple | int] = None  # For transposition table
+    state_key: Optional[Tuple | int] = None
 
 
 class GameStateAdapter:
@@ -75,7 +72,6 @@ class GameStateAdapter:
 
     def clone(self) -> GameStateAdapter:
         """Return a deep copy of the current game state."""
-        # create a new, empty object and copy over the state
         new_state = GameStateAdapter.__new__(GameStateAdapter)
         new_state._rule = self._rule
         new_state.player = self.player
@@ -101,13 +97,11 @@ class GameStateAdapter:
         """
         Apply an action and update the game state.
         """
-        # card is played
         self.hands[self.player, action] = 0
         self.current_trick[self.nr_cards_in_trick] = action
         self.nr_cards_in_trick += 1
 
         if self.nr_cards_in_trick == 4:
-            # trick is complete
             self.tricks[self.nr_tricks] = self.current_trick
             self.trick_winner[self.nr_tricks] = self._rule.calc_winner(self.current_trick, self.trick_first_player[self.nr_tricks], self.trump)
             self.trick_points[self.nr_tricks] = self._rule.calc_points(self.current_trick, self.nr_tricks == 8, self.trump)
@@ -123,7 +117,6 @@ class GameStateAdapter:
             self.player = winner
             if self.nr_tricks < 9:
                 self.trick_first_player[self.nr_tricks] = self.player
-                # rebind to the next trick row and clear
                 self.current_trick = self.tricks[self.nr_tricks]
                 self.current_trick.fill(-1)
         else:
@@ -144,7 +137,6 @@ class GameStateAdapter:
         
         score = self.points[player_team] - self.points[opponent_team]
         
-        # check if a team made the match (only valid at terminal state)
         if self.nr_tricks == 9:
             if self.points[player_team] > 0 and self.points[opponent_team] == 0:
                 score += 100
@@ -173,12 +165,10 @@ class MCTSAgent(Agent):
         """
         Determine trump using MCTS. The action space includes suits, obenabe, uneufe, and push.
         """
-        # Simple evaluation: sample worlds and simulate with selected trump, pick best average score
-        action_space = list(range(6))  # 0-3 suits, 4 Obe, 5 Une
+        action_space = list(range(6))
         if obs.trump == -1 and obs.forehand == -1:
             action_space.append(PUSH)
 
-        # If only one option, return immediately
         if len(action_space) == 1:
             return action_space[0]
 
@@ -187,9 +177,8 @@ class MCTSAgent(Agent):
         best_value = -np.inf
 
         for trump_action in action_space:
-            # Handle PUSH separately: we don't simulate with an invalid trump value
             if trump_action == PUSH:
-                avg = -1e6  # simple baseline to avoid selecting PUSH by default
+                avg = -1e6
             else:
                 total = 0.0
                 count = 0
@@ -210,14 +199,12 @@ class MCTSAgent(Agent):
     def _obs_with_trump(self, obs: GameObservation, trump_action: int) -> GameObservation:
         """Create a shallow copy of obs with the given trump set (used for trump evaluation)."""
         new_obs = GameObservation()
-        # Basic fields
         new_obs.dealer = int(obs.dealer)
         new_obs.player = int(obs.player)
         new_obs.player_view = int(obs.player_view)
         new_obs.trump = int(trump_action)
         new_obs.forehand = int(obs.forehand)
         new_obs.declared_trump = int(obs.declared_trump)
-        # Copy arrays
         new_obs.hand = np.array(obs.hand, copy=True)
         new_obs.tricks = np.array(obs.tricks, copy=True)
         new_obs.trick_winner = np.array(obs.trick_winner, copy=True)
@@ -244,7 +231,6 @@ class MCTSAgent(Agent):
 
         root = self._search(obs, action_space)
 
-        # choose action with most visits
         best_action = -1
         max_visits = -1
         for action, child in root.children.items():
@@ -270,7 +256,6 @@ class MCTSAgent(Agent):
 
         iters = 0
         while True:
-            # Budget check
             if deadline is None:
                 if iters >= self.config.iterations:
                     break
@@ -278,31 +263,24 @@ class MCTSAgent(Agent):
                 if time.perf_counter() >= deadline:
                     break
 
-            # One determinization per full simulation
             hands = self._sample_hidden_state(obs)
 
-            # INIT STATE FOR THIS SIMULATION
             state = GameStateAdapter(obs, hands)
             node = root
 
-            # SELECTION
             while not node.untried_actions and node.children:
                 node = self._select(node)
                 state.step(node.action)
 
-            # EXPANSION
             if node.untried_actions:
                 action = int(self._rng.choice(node.untried_actions))
                 state.step(action)
                 node = self._expand(node, action, state)
 
-            # SIMULATION (Rollout)
             reward = self._rollout(state, root_player=obs.player)
 
-            # BACKPROPAGATION
             self._backpropagate(node, reward, root_player=obs.player)
 
-            # Count this completed simulation
             iters += 1
 
         return root
@@ -319,8 +297,6 @@ class MCTSAgent(Agent):
             if child.visits == 0:
                 score = np.inf
             else:
-                # child.value is stored from the child's player_to_move perspective
-                # Convert it to the current node player's team perspective for selection.
                 same_team = (child.player_to_move % 2) == (node.player_to_move % 2)
                 exploit_raw = child.value / child.visits
                 exploit = exploit_raw if same_team else -exploit_raw
@@ -337,7 +313,6 @@ class MCTSAgent(Agent):
         """
         node.untried_actions.remove(action)
         new_node = MCTSNode(parent=node, action=action, player_to_move=state.player)
-        # Initialize child untried actions from the current state
         new_node.untried_actions = state.valid_actions()
         node.children[action] = new_node
         return new_node
@@ -347,13 +322,11 @@ class MCTSAgent(Agent):
         Simulate to the end of the game and return the final normalized score
         from the root player's team perspective.
         """
-        # Continue until terminal state (full game simulated)
         while not state.is_terminal():
             hand = state.hands[state.player]
             valid_cards = self._rule.get_valid_cards(hand, state.current_trick, state.nr_cards_in_trick, state.trump)
             valid_indices = np.flatnonzero(valid_cards)
             if len(valid_indices) == 0:
-                # Determinization inconsistency: stop and evaluate current score
                 break
             action = self._rng.choice(valid_indices)
             state.step(action)
@@ -365,7 +338,6 @@ class MCTSAgent(Agent):
         """
         while node is not None:
             node.visits += 1
-            # reward is from the root player's team perspective
             if (node.player_to_move % 2) != (root_player % 2):
                 node.value -= reward
             else:
@@ -376,7 +348,6 @@ class MCTSAgent(Agent):
         """
         Generates a random, consistent assignment of cards for hidden hands.
         """
-        # Known cards: our hand and all played cards
         known = np.zeros(36, dtype=np.int32)
         known[convert_one_hot_encoded_cards_to_int_encoded_list(obs.hand)] = 1
 
@@ -384,7 +355,6 @@ class MCTSAgent(Agent):
             for card in obs.tricks[t]:
                 if card != -1:
                     known[card] = 1
-        # include current trick cards
         if obs.nr_tricks < 9 and obs.current_trick is not None:
             for k in range(obs.nr_cards_in_trick):
                 card = obs.current_trick[k]
@@ -397,9 +367,6 @@ class MCTSAgent(Agent):
         hands = np.zeros((4, 36), dtype=np.int32)
         hands[obs.player] = obs.hand
 
-        # Determine how many cards each opponent should have left
-        # Each player starts with 9 cards. Each completed trick consumes 1 card per player.
-        # In the current trick, some players may already have played.
         counts_needed = [0, 0, 0, 0]
         first = int(obs.trick_first_player[obs.nr_tricks]) if obs.nr_tricks < 9 else 0
         played_this_trick_players = set()
@@ -408,16 +375,12 @@ class MCTSAgent(Agent):
 
         for p in range(4):
             have = int(np.sum(hands[p]))
-            # expected remaining cards
             expected = 9 - obs.nr_tricks - (1 if p in played_this_trick_players else 0)
             if p == obs.player:
-                # sanity: our observed hand size should equal expected
-                # if mismatch due to data, clamp to observed
                 expected = have
             need = max(0, expected - have)
             counts_needed[p] = need
 
-        # Assign unknown cards to other players according to required counts
         pos = 0
         for p in range(4):
             if p == obs.player:
@@ -429,7 +392,6 @@ class MCTSAgent(Agent):
                 if take:
                     hands[p, take] = 1
 
-        # Any remaining unknown cards (due to mismatches) are distributed round-robin
         while pos < len(unknown_cards):
             for p in range(4):
                 if p == obs.player:
@@ -445,7 +407,6 @@ class MCTSAgent(Agent):
 def main():
     logging.basicConfig(level=logging.WARNING)
 
-    # setup the arena
     arena = Arena(nr_games_to_play=25)
     player = AgentRandomSchieber()
     my_player = MCTSAgent(MCTSConfig(iterations=500, time_limit_ms=250, determinization_samples=8))

@@ -25,16 +25,13 @@ class JassNet(nn.Module):
         """
         super(JassNet, self).__init__()
         
-        # Initial embedding
         self.input_fc = nn.Linear(input_shape, hidden_dim)
         self.input_bn = nn.BatchNorm1d(hidden_dim)
         
-        # Residual Tower
         self.res_blocks = nn.ModuleList([
             ResidualBlock(hidden_dim) for _ in range(num_res_blocks)
         ])
         
-        # Policy Head
         self.policy_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.BatchNorm1d(hidden_dim // 2),
@@ -42,7 +39,6 @@ class JassNet(nn.Module):
             nn.Linear(hidden_dim // 2, 36)
         )
         
-        # Value Head (Score Difference: -1 to 1)
         self.value_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.BatchNorm1d(hidden_dim // 2),
@@ -51,7 +47,6 @@ class JassNet(nn.Module):
             nn.Tanh()
         )
         
-        # Win Head (Win Probability: 0 to 1)
         self.win_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.BatchNorm1d(hidden_dim // 2),
@@ -61,14 +56,11 @@ class JassNet(nn.Module):
         )
 
     def forward(self, x):
-        # Input processing
         x = F.relu(self.input_bn(self.input_fc(x)))
         
-        # Residual blocks
         for block in self.res_blocks:
             x = block(x)
         
-        # Heads
         policy = F.softmax(self.policy_head(x), dim=1)
         value = self.value_head(x)
         win_prob = self.win_head(x)

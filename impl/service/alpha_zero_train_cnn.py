@@ -24,7 +24,6 @@ from jass.game.game_util import deal_random_hand
 
 @dataclass
 class TrainConfig:
-    # Training parameters
     iterations: int = 100
     games_per_iteration: int = 50
     mcts_simulations: int = 400
@@ -32,11 +31,9 @@ class TrainConfig:
     learning_rate: float = 0.002
     train_steps: int = 100
     
-    # Model architecture
     hidden_dim: int = 256
     num_res_blocks: int = 3
     
-    # System
     checkpoint_dir: str = "impl/models"
     model_name: str = "alpha_zero_model_cnn.pth"
     replay_buffer_size: int = 50000
@@ -53,87 +50,7 @@ class TrainWrapper(NeuralNetwork):
         tensor_in = convert_obs_to_tensor(obs).to(self.device)
         with torch.no_grad():
             policy, value, win_prob = self.model(tensor_in)
-        # Return value (score difference) for MCTS
         return policy.cpu().numpy()[0], value.item()
-
-def self_play(agent: AlphaZeroAgent, num_games: int) -> List[Tuple[GameObservation, np.ndarray, float]]:
-    dataset = []
-    rule = RuleSchieber()
-    
-    for _ in range(num_games):
-        game = GameSim(rule=rule)
-        dealer = np.random.randint(4)
-        game.init_from_cards(hands=deal_random_hand(), dealer=dealer)
-        
-        trump = np.random.randint(6)
-        game.action_trump(trump)
-        
-        game_history = []
-        
-        while game.state.nr_tricks < 9:
-            player = game.state.player
-            obs = game.get_observation()
-            
-            root = agent._search(obs)
-            
-            # Policy target is the visit count distribution from MCTS
-            policy = np.zeros(36, dtype=np.float32)
-            for action, child in root.children.items():
-                policy[action] = child.visits
-            
-            # Only normalize - don't mask again! MCTS already only visited valid actions
-            if policy.sum() > 0:
-                policy /= policy.sum()
-            else:
-                # Shouldn't happen, but fallback to uniform over valid actions
-                valid_actions = rule.get_valid_cards_from_obs(obs)
-                valid_mask = np.flatnonzero(valid_actions)
-                policy[valid_mask] = 1.0 / len(valid_mask)
-            
-            game_history.append((obs, policy, player))
-            
-            action = np.random.choice(36, p=policy)
-            game.action_play_card(action)
-            
-        # Calculate score with match bonus
-        points_team_0 = game.state.points[0]
-        points_team_1 = game.state.points[1]
-        
-        # Check for match (all 9 tricks won by one team)
-        # Note: game.state.points might not include the 100 bonus depending on implementation,
-        # but let's manually check tricks won if needed. 
-        # Actually, GameSim updates points correctly including match bonus if configured,
-        # but let's be safe and use the same logic as GameStateAdapter.score
-        
-        # Count tricks per team
-        tricks_0 = 0
-        tricks_1 = 0
-        # We can check trick_winner array
-        for t in range(9):
-            w = game.state.trick_winner[t]
-            if w == 0 or w == 2:
-                tricks_0 += 1
-            else:
-                tricks_1 += 1
-                
-        if tricks_0 == 9:
-            points_team_0 += 100
-        elif tricks_1 == 9:
-            points_team_1 += 100
-            
-        score_diff = (points_team_0 - points_team_1) / 257.0 # Normalized with match bonus
-        
-        # Binary win: did team 0 win?
-        team_0_won = 1.0 if points_team_0 > points_team_1 else 0.0
-        
-        for obs, policy, player in game_history:
-            val_score = score_diff if (player % 2 == 0) else -score_diff
-            # Win value from current player's perspective
-            is_team_0 = (player % 2 == 0)
-            val_win = team_0_won if is_team_0 else (1.0 - team_0_won)
-            dataset.append((obs, policy, val_score, val_win))
-            
-    return dataset
 
 def self_play_single_game(args) -> List[Tuple[GameObservation, np.ndarray, float]]:
     """
@@ -142,13 +59,11 @@ def self_play_single_game(args) -> List[Tuple[GameObservation, np.ndarray, float
     """
     model_state_dict, hidden_dim, num_res_blocks, mcts_simulations, game_idx = args
     
-    # Create model for this worker (CPU to avoid GPU contention)
     device = torch.device("cpu")
     model = JassNet(hidden_dim=hidden_dim, num_res_blocks=num_res_blocks).to(device)
     model.load_state_dict(model_state_dict)
     model.eval()
     
-    # Create agent
     agent = AlphaZeroAgent(
         config=AlphaZeroConfig(
             iterations=mcts_simulations,
@@ -158,7 +73,6 @@ def self_play_single_game(args) -> List[Tuple[GameObservation, np.ndarray, float
         network=TrainWrapper(model, device)
     )
     
-    # Play game
     dataset = []
     rule = RuleSchieber()
     
@@ -177,16 +91,13 @@ def self_play_single_game(args) -> List[Tuple[GameObservation, np.ndarray, float
         
         root = agent._search(obs)
         
-        # Policy target is the visit count distribution from MCTS
         policy = np.zeros(36, dtype=np.float32)
         for action, child in root.children.items():
             policy[action] = child.visits
         
-        # Only normalize - don't mask again! MCTS already only visited valid actions
         if policy.sum() > 0:
             policy /= policy.sum()
         else:
-            # Shouldn't happen, but fallback to uniform over valid actions
             valid_actions = rule.get_valid_cards_from_obs(obs)
             valid_mask = np.flatnonzero(valid_actions)
             policy[valid_mask] = 1.0 / len(valid_mask)
@@ -196,11 +107,9 @@ def self_play_single_game(args) -> List[Tuple[GameObservation, np.ndarray, float
         action = np.random.choice(36, p=policy)
         game.action_play_card(action)
     
-    # Calculate score with match bonus
     points_team_0 = game.state.points[0]
     points_team_1 = game.state.points[1]
     
-    # Count tricks per team for match bonus
     tricks_0 = 0
     tricks_1 = 0
     for t in range(9):
@@ -217,12 +126,10 @@ def self_play_single_game(args) -> List[Tuple[GameObservation, np.ndarray, float
         
     score_diff = (points_team_0 - points_team_1) / 257.0
     
-    # Binary win: did team 0 win?
     team_0_won = 1.0 if points_team_0 > points_team_1 else 0.0
     
     for obs, policy, player in game_history:
         val_score = score_diff if (player % 2 == 0) else -score_diff
-        # Win value from current player's perspective
         is_team_0 = (player % 2 == 0)
         val_win = team_0_won if is_team_0 else (1.0 - team_0_won)
         dataset.append((obs, policy, val_score, val_win))
@@ -235,20 +142,16 @@ def self_play_parallel(model, config: TrainConfig, num_games: int) -> List[Tuple
     """
     print(f"  Using {config.num_workers} parallel workers")
     
-    # Get model state dict (CPU)
     model_state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
     
-    # Prepare arguments for each game
     args_list = [
         (model_state_dict, config.hidden_dim, config.num_res_blocks, config.mcts_simulations, i)
         for i in range(num_games)
     ]
     
-    # Run games in parallel
     with Pool(processes=config.num_workers) as pool:
         results = pool.map(self_play_single_game, args_list)
     
-    # Flatten results
     dataset = []
     for game_data in results:
         dataset.extend(game_data)
@@ -260,21 +163,17 @@ def evaluate_vs_baseline(model, device, num_games=10):
     from jass.arena.arena import Arena
     from impl.agents.alpha_zero import MCTSAgent, MCTSConfig
     
-    # AlphaZero agent with current model
     az_network = TrainWrapper(model, device)
-    az_config = AlphaZeroConfig(iterations=400, time_limit_ms=None, dirichlet_alpha=0.0)  # No exploration
+    az_config = AlphaZeroConfig(iterations=400, time_limit_ms=None, dirichlet_alpha=0.0)
     az_agent = AlphaZeroAgent(config=az_config, network=az_network)
     
-    # Baseline MCTS
     mcts_config = MCTSConfig(iterations=400, time_limit_ms=None)
     mcts_agent = MCTSAgent(config=mcts_config)
     
-    # Play games
     arena = Arena(nr_games_to_play=num_games, print_every_x_games=999)
     arena.set_players(az_agent, mcts_agent, az_agent, mcts_agent)
     arena.play_all_games()
     
-    # Get results
     points_team_0 = arena.points_team_0
     points_team_1 = arena.points_team_1
     avg_diff = np.mean(points_team_0 - points_team_1)
@@ -285,7 +184,6 @@ def evaluate_vs_baseline(model, device, num_games=10):
 def train_loop():
     config = TrainConfig()
     
-    # Device selection: CUDA > MPS > CPU
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -297,13 +195,10 @@ def train_loop():
     print(f"Using {config.num_workers} workers for parallel self-play")
     print(f"Model architecture: hidden_dim={config.hidden_dim}, num_res_blocks={config.num_res_blocks}")
     
-    # Create model with config parameters
     model = JassNet(hidden_dim=config.hidden_dim, num_res_blocks=config.num_res_blocks).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=1e-4)
-    # Cosine annealing: LR decays from initial to near-zero over training
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.iterations, eta_min=1e-5)
     
-    # Replay Buffer
     replay_buffer = deque(maxlen=config.replay_buffer_size)
     
     os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -322,7 +217,6 @@ def train_loop():
             num_games=config.games_per_iteration
         )
         
-        # Add new data to buffer
         replay_buffer.extend(new_data)
         print(f"Generated {len(new_data)} samples. Buffer size: {len(replay_buffer)}")
         
@@ -359,17 +253,12 @@ def train_loop():
             optimizer.zero_grad()
             pred_policy, pred_value, pred_win_prob = model(tensor_obs)
             
-            # Value loss (MSE on score difference)
             loss_v = torch.mean((tensor_value - pred_value) ** 2)
-            # Policy loss (cross entropy)
             loss_p = -torch.mean(torch.sum(tensor_policy * torch.log(pred_policy + 1e-8), dim=1))
-            # Win loss (binary cross entropy)
             loss_w = F.binary_cross_entropy(pred_win_prob, tensor_win)
             
-            # Combined loss
             loss = loss_v + loss_p + loss_w
             loss.backward()
-            # Gradient clipping for stability
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
@@ -386,17 +275,14 @@ def train_loop():
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Training Loss - Total: {avg_loss:.4f} | Value: {avg_loss_v:.4f} | Policy: {avg_loss_p:.4f} | Win: {avg_loss_w:.4f} | LR: {current_lr:.6f}")
         
-        # Save best model
         if avg_loss < best_loss:
             best_loss = avg_loss
             best_model_path = os.path.join(config.checkpoint_dir, "best_" + config.model_name)
             torch.save(model.state_dict(), best_model_path)
             print(f"New best model saved! Loss: {best_loss:.4f}")
         
-        # Step learning rate scheduler
         scheduler.step()
         
-        # Evaluate every 10 iterations
         if (iteration + 1) % 10 == 0:
             print(f"\nEvaluating against baseline MCTS...")
             model.eval()
@@ -410,4 +296,3 @@ def train_loop():
 
 if __name__ == "__main__":
     train_loop()
-

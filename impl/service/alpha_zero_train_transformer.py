@@ -26,18 +26,17 @@ from jass.game.game_util import deal_random_hand
 class TrainConfig:
     iterations: int = 50
     games_per_iteration: int = 20
-    mcts_simulations: int = 250  # Reduced from 200 for faster generation
+    mcts_simulations: int = 250
     batch_size: int = 64
-    learning_rate: float = 0.0001  # Lower LR for transformer
+    learning_rate: float = 0.0001
     checkpoint_dir: str = "impl/models"
     model_name: str = "alpha_zero_transformer_model.pth"
     replay_buffer_size: int = 50000
     min_buffer_size: int = 1000
     train_steps: int = 100
-    num_workers: int = max(1, cpu_count() - 1)  # Leave 1 core free
+    num_workers: int = max(1, cpu_count() - 1)
     
-    # Transformer architecture config
-    use_sequence_model: bool = False  # Use JassTransformerSequence vs JassTransformer
+    use_sequence_model: bool = False
     embed_dim: int = 128
     num_heads: int = 4
     ff_dim: int = 256
@@ -63,8 +62,7 @@ def self_play_single_game(args) -> List[Tuple[GameObservation, np.ndarray, float
     """
     model_state_dict, device_str, mcts_simulations, model_config, game_idx = args
     
-    # Create model for this worker
-    device = torch.device("cpu")  # Workers use CPU to avoid GPU contention
+    device = torch.device("cpu")
     
     if model_config['use_sequence_model']:
         model = JassTransformerSequence(
@@ -88,7 +86,6 @@ def self_play_single_game(args) -> List[Tuple[GameObservation, np.ndarray, float
     model.to(device)
     model.eval()
     
-    # Create agent
     agent = AlphaZeroAgent(
         config=AlphaZeroConfig(
             iterations=mcts_simulations,
@@ -98,7 +95,6 @@ def self_play_single_game(args) -> List[Tuple[GameObservation, np.ndarray, float
         network=TrainWrapper(model, device)
     )
     
-    # Play game
     dataset = []
     rule = RuleSchieber()
     
@@ -117,16 +113,13 @@ def self_play_single_game(args) -> List[Tuple[GameObservation, np.ndarray, float
         
         root = agent._search(obs)
         
-        # Policy target is the visit count distribution from MCTS
         policy = np.zeros(36, dtype=np.float32)
         for action, child in root.children.items():
             policy[action] = child.visits
         
-        # Only normalize - don't mask again! MCTS already only visited valid actions
         if policy.sum() > 0:
             policy /= policy.sum()
         else:
-            # Shouldn't happen, but fallback to uniform over valid actions
             valid_actions = rule.get_valid_cards_from_obs(obs)
             valid_mask = np.flatnonzero(valid_actions)
             policy[valid_mask] = 1.0 / len(valid_mask)
@@ -136,11 +129,9 @@ def self_play_single_game(args) -> List[Tuple[GameObservation, np.ndarray, float
         action = np.random.choice(36, p=policy)
         game.action_play_card(action)
     
-    # Calculate score with match bonus
     points_team_0 = game.state.points[0]
     points_team_1 = game.state.points[1]
     
-    # Count tricks per team for match bonus
     tricks_0 = 0
     tricks_1 = 0
     for t in range(9):
@@ -155,7 +146,7 @@ def self_play_single_game(args) -> List[Tuple[GameObservation, np.ndarray, float
     elif tricks_1 == 9:
         points_team_1 += 100
         
-    score_diff = (points_team_0 - points_team_1) / 257.0  # Normalized with match bonus
+    score_diff = (points_team_0 - points_team_1) / 257.0 
     
     for obs, policy, player in game_history:
         val = score_diff if (player % 2 == 0) else -score_diff
@@ -169,21 +160,17 @@ def self_play_parallel(model, device, num_games: int, mcts_simulations: int, mod
     """
     print(f"  Using {num_workers} parallel workers")
     
-    # Get model state dict (CPU)
     model_state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
     device_str = str(device)
     
-    # Prepare arguments for each game
     args_list = [
         (model_state_dict, device_str, mcts_simulations, model_config, i)
         for i in range(num_games)
     ]
     
-    # Run games in parallel
     with Pool(processes=num_workers) as pool:
         results = pool.map(self_play_single_game, args_list)
     
-    # Flatten results
     dataset = []
     for game_data in results:
         dataset.extend(game_data)
@@ -193,7 +180,6 @@ def self_play_parallel(model, device, num_games: int, mcts_simulations: int, mod
 def train_loop():
     config = TrainConfig()
     
-    # Device selection: CUDA > MPS > CPU
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -203,7 +189,6 @@ def train_loop():
     
     print(f"Using device: {device}")
     
-    # Create transformer model
     if config.use_sequence_model:
         print("Using JassTransformerSequence model")
         model = JassTransformerSequence(
@@ -224,13 +209,11 @@ def train_loop():
             dropout=config.dropout
         ).to(device)
     
-    # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     
-    # Optimizer with weight decay for transformer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
@@ -238,14 +221,12 @@ def train_loop():
         betas=(0.9, 0.999)
     )
     
-    # Learning rate scheduler (cosine annealing)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=config.iterations,
         eta_min=config.learning_rate * 0.1
     )
     
-    # Replay Buffer
     replay_buffer = deque(maxlen=config.replay_buffer_size)
     
     os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -277,7 +258,6 @@ def train_loop():
             num_workers=config.num_workers
         )
         
-        # Add new data to buffer
         replay_buffer.extend(new_data)
         print(f"Generated {len(new_data)} samples. Buffer size: {len(replay_buffer)}")
         
@@ -285,7 +265,6 @@ def train_loop():
             print("Buffer too small, skipping training...")
             continue
         
-        # Training phase
         model.train()
         total_loss = 0
         total_loss_v = 0
@@ -310,17 +289,13 @@ def train_loop():
             optimizer.zero_grad()
             pred_policy, pred_value = model(tensor_obs)
             
-            # Value loss (MSE)
             loss_v = torch.mean((tensor_value - pred_value) ** 2)
             
-            # Policy loss (Cross-entropy)
             loss_p = -torch.mean(torch.sum(tensor_policy * torch.log(pred_policy + 1e-8), dim=1))
             
-            # Combined loss
             loss = loss_v + loss_p
             loss.backward()
             
-            # Gradient clipping for stability
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             optimizer.step()
@@ -335,17 +310,14 @@ def train_loop():
         
         print(f"Training Loss - Total: {avg_loss:.4f} | Value: {avg_loss_v:.4f} | Policy: {avg_loss_p:.4f}")
         
-        # Update learning rate
         scheduler.step()
         
-        # Save best model (state_dict only)
         if avg_loss < best_loss:
             best_loss = avg_loss
             best_model_path = os.path.join(config.checkpoint_dir, "best_" + config.model_name)
             torch.save(model.state_dict(), best_model_path)
             print(f"New best model saved! Loss: {best_loss:.4f}")
     
-    # Save final model (state_dict only)
     final_model_path = os.path.join(config.checkpoint_dir, config.model_name)
     torch.save(model.state_dict(), final_model_path)
     print(f"\nFinal model saved to {final_model_path}")
