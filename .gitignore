@@ -137,3 +137,5 @@ dmypy.json
 
 *.csv
 !2018_10_18_trump.csv
+
+*.DS_Store
